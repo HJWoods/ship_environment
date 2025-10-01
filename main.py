@@ -7,8 +7,8 @@ obs, info = env.reset()
 
 done = False
 while not done:
-    #action = env.action_space.sample()
-    action = 7
+    action = env.action_space.sample()  
+    action = 2
     obs, reward, terminated, truncated, info = env.step(action)
     done = terminated or truncated
 env.close()

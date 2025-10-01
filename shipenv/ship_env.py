@@ -17,22 +17,23 @@ import importlib.resources as ir
 class ShipParams:
     # Simulation
     dt: float = 0.1                 # seconds per step
-    max_steps: int = 5000
+    max_steps: int = 500
 
     # World bounds (square [-L, L] x [-L, L])
     world_size: float = 10.0
 
     # Control (accelerations, not velocities)
-    thrust_accel: float = 0.15       # m/s^2 (forward/back along body x)
-    torque_accel: float = 0.2       # rad/s^2 (left/right yaw)
+    thrust_accel: float = 1.5       # m/s^2 (forward accel)
+    brake_accel: float = 2.0        # m/s^2 (deceleration when braking)
+    torque_accel: float = 2.5       # rad/s^2 (left/right yaw acceleration)
 
     # Limits
-    v_max: float = 5.0              # m/s
-    w_max: float = 1.0              # rad/s
+    v_max: float = 5.0              # m/s (non-negative; no reverse)
+    w_max: float = 4.0              # rad/s
 
-    # Drag
-    lin_drag: float = 0.1           # linear drag coeff on v
-    ang_drag: float = 0.1           # angular drag coeff on ω
+    # Drag (first-order viscous)
+    lin_drag: float = 0.1           # on v
+    ang_drag: float = 0.12          # on w
 
     # Episode / reward
     goal_radius: float = 0.3
@@ -68,7 +69,7 @@ class GraphicsParams:
     water_primary: Tuple[int, int, int] = (120, 170, 220)   # base color
     water_secondary: Tuple[int, int, int] = (90, 140, 200)  # darker streaks
     water_wave_px: int = 24
-    water_scroll_px_per_step: int = 2
+    water_scroll_px_per_step: int = 0   # keep static to avoid visual drift illusions
 
     # Trail
     trail_len: int = 100
@@ -81,6 +82,13 @@ class GraphicsParams:
     sprite_path: Optional[str] = None
     sprite_meters_long: float = 0.9
 
+    # Sprite alignment tweaks
+    sprite_heading_deg_offset: float = 0.0           # rotate sprite to match physics heading
+    sprite_px_offset: Tuple[int, int] = (0, 0)       # post-rotation pixel nudge (x,y)
+
+    # Debug overlays
+    show_velocity_vector: bool = False               # draw a small v arrow
+
     # Rocks appearance
     rock_fill: Tuple[int, int, int] = (110, 110, 110)
     rock_stroke: Tuple[int, int, int] = (40, 40, 40)
@@ -89,28 +97,30 @@ class GraphicsParams:
     goal_color: Tuple[int, int, int] = (0, 180, 0)
 
     # Optional overlays
-    show_grid: bool = False  # left in, but off by default
+    show_grid: bool = False  # off by default
 
 
 class ShipEnv(gym.Env):
     """
-    2D ship environment with discrete accelerations:
-      - Action: 9 discrete combinations of (thrust, torque) in {-1,0,1}^2
-      - State:  x, y, θ, v_forward, ω
-      - Obs:    [x, y, cosθ, sinθ, v, ω]
+    No lateral slip. One action per step; turning and moving are exclusive.
+
+    Action space: Discrete(4)
+        0: Turn left    (angular acceleration +torque_accel)  -> rotate in place this step
+        1: Turn right   (angular acceleration -torque_accel)  -> rotate in place this step
+        2: Accelerate   (linear acceleration +thrust_accel)   -> translate straight, no turning
+        3: Brake        (linear acceleration -brake_accel)    -> translate straight, no turning; v>=0
 
     Kinematics:
-      - Exact unicycle integration (no lateral/slip dof): ship moves only along its body x-axis.
+        * Turn steps (0/1): update w, then θ; apply linear drag on v; **do not move x,y**.
+        * Move steps (2/3): lock w=0 (no rotation), update v; move x,y strictly along heading θ.
+        * v ∈ [0, v_max], no reverse. θ increases CCW, θ=0 points +x.
 
-    Hazards:
-      - Static circular rocks (configurable count/radius). Touching a rock ends the episode with a penalty.
-
-    Goal:
-      - Random by default (within bounds & margin), or pass a goal in reset(options={'goal':[x, y]}).
-
-    Render modes:
-      - "human": pygame window
-      - "rgb_array": returns HxWx3 image via info["frame"]
+    Rendering:
+        * Optional sprite with live alignment controls:
+            [ / ] : sprite_heading_deg_offset ±5°
+            Arrow keys : sprite_px_offset x/y nudge
+            V : toggle velocity vector
+            0 : reset offsets
     """
     metadata = {"render_modes": ["human", "rgb_array"]}
 
@@ -126,32 +136,31 @@ class ShipEnv(gym.Env):
         self.G = graphics or GraphicsParams()
         self.render_mode = render_mode
 
-        # Action space: 3x3 grid of (thrust, torque) directions
-        self._action_map = np.array(
-            [(tx, rz) for tx in (-1, 0, 1) for rz in (-1, 0, 1)],
-            dtype=np.int8,
-        )
-        self.action_space = spaces.Discrete(len(self._action_map))
+        # Discrete(4) actions (see docstring)
+        self.action_space = spaces.Discrete(4)
 
-        # Observation space
+        # Observation space: [x, y, cosθ, sinθ, v, w]
         high = np.array(
             [self.P.world_size, self.P.world_size, 1.0, 1.0, self.P.v_max, self.P.w_max],
             dtype=np.float32,
         )
-        low = -high.copy()
-        low[2:4] = -1.0  # cos, sin
+        low = np.array(
+            [-self.P.world_size, -self.P.world_size, -1.0, -1.0, 0.0, -self.P.w_max],
+            dtype=np.float32,
+        )
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         # State
         self.x = self.y = self.theta = 0.0
-        self.v = self.w = 0.0
+        self.v = 0.0   # forward speed, >= 0
+        self.w = 0.0   # yaw rate
         self.goal = np.array(goal if goal is not None else [0.0, 0.0], dtype=np.float32)
         self.steps = 0
 
-        # Hazards (rock centers in world coords)
+        # Rocks
         self.rocks: List[Tuple[float, float]] = []
 
-        # Render internals
+        # Rendering
         self._screen = None
         self._clock = None
         self._surf = None
@@ -161,7 +170,7 @@ class ShipEnv(gym.Env):
         self._sprite_img_scaled = None
         self._trail: List[Tuple[float, float]] = []
 
-        # Precompute pixel sizes
+        # Pixel geometry
         L = self.P.world_size
         s = self.G.render_scale_px_per_m
         pad = self.G.render_padding_px
@@ -177,48 +186,42 @@ class ShipEnv(gym.Env):
         rng = np.random.default_rng(seed)
         L = self.P.world_size
 
-        # Start pose
+        # Start pose/speeds
         self.x = float(-0.5 * L + rng.normal(0, self.P.start_noise))
         self.y = float(rng.normal(0, self.P.start_noise))
         self.theta = float(rng.uniform(-math.pi, math.pi))
-        self.v = float(rng.normal(0, 0.1))
+        self.v = max(0.0, float(rng.normal(0, 0.1)))  # non-negative
         self.w = float(rng.normal(0, 0.1))
         self.steps = 0
 
-        # Goal: options override; otherwise random if enabled
+        # Goal
         if options and "goal" in options:
             self.goal = np.array(options["goal"], dtype=np.float32)
         elif self.P.random_goal:
             self.goal = self._sample_goal(rng)
 
-        # Reset trail
+        # Trail
         self._trail = [(self.x, self.y)]
 
-        # Place rocks
+        # Rocks
         self.rocks = self._sample_rocks(rng)
 
-        # Set up rendering on-demand
+        # Rendering setup
         if self.render_mode in ("human", "rgb_array"):
             if not pygame.get_init():
                 pygame.init()
-
-            # Window for human mode
             if self.render_mode == "human":
                 if self._screen is None:
                     pygame.display.set_caption("ShipEnv")
                     self._screen = pygame.display.set_mode((self._win_w, self._win_h))
                 if self._clock is None:
                     self._clock = pygame.time.Clock()
-
-            # Drawing surface (always)
             self._surf = pygame.Surface((self._win_w, self._win_h)).convert()
-
-            # Build water texture & reset scroll
             self._water_surf = pygame.Surface((self._win_w, self._win_h)).convert()
             self._build_water(self._water_surf)
             self._water_offset = 0
 
-            # Load/scale sprite (explicit path or packaged default)
+            # Sprite (packaged default if none provided)
             self._sprite_img = self._sprite_img_scaled = None
             sprite_path = self.G.sprite_path
             if sprite_path is None:
@@ -228,17 +231,16 @@ class ShipEnv(gym.Env):
                         sprite_path = str(candidate)
                 except Exception:
                     sprite_path = None
-
             if sprite_path:
                 try:
                     raw = pygame.image.load(sprite_path).convert_alpha()
                     self._sprite_img = raw
                     px_per_m = self.G.render_scale_px_per_m
                     target_len_px = max(1, int(self.G.sprite_meters_long * px_per_m))
-                    w, h = raw.get_size()
-                    scale = target_len_px / max(w, h)
+                    w0, h0 = raw.get_size()
+                    scale = target_len_px / max(w0, h0)
                     self._sprite_img_scaled = pygame.transform.smoothscale(
-                        raw, (max(1, int(w * scale)), max(1, int(h * scale)))
+                        raw, (max(1, int(w0 * scale)), max(1, int(h0 * scale)))
                     )
                 except Exception as e:
                     print(f"[ShipEnv] Sprite load failed ({sprite_path}): {e}")
@@ -247,35 +249,48 @@ class ShipEnv(gym.Env):
         return self._obs(), {"goal": self.goal.copy(), "rocks": list(self.rocks)}
 
     def step(self, action: int):
-        tx_dir, rz_dir = self._action_map[int(action)]
-        a = tx_dir * self.P.thrust_accel
-        alpha = rz_dir * self.P.torque_accel
+        if action not in (0, 1, 2, 3):
+            raise ValueError("Invalid action for Discrete(4).")
 
-        # Apply drag to accelerations (first-order viscous)
-        a -= self.P.lin_drag * self.v
-        alpha -= self.P.ang_drag * self.w
-
-        # Integrate velocities
-        self.v = float(np.clip(self.v + a * self.P.dt, -self.P.v_max, self.P.v_max))
-        self.w = float(np.clip(self.w + alpha * self.P.dt, -self.P.w_max, self.P.w_max))
-
-        # ---- Exact unicycle integration (no sideways motion) ----
-        # x_dot = v cosθ,  y_dot = v sinθ,  θ_dot = w  (v, w constant over dt)
-        v = self.v
-        w = self.w
         dt = self.P.dt
-        theta0 = self.theta
-        if abs(w) < 1e-9:
-            # Straight line
-            self.x += v * math.cos(theta0) * dt
-            self.y += v * math.sin(theta0) * dt
-            self.theta = self._wrap_angle(theta0 + w * dt)
-        else:
-            # Constant turn rate arc
-            self.x += (v / w) * (math.sin(theta0 + w * dt) - math.sin(theta0))
-            self.y += -(v / w) * (math.cos(theta0 + w * dt) - math.cos(theta0))
-            self.theta = self._wrap_angle(theta0 + w * dt)
-        # ---------------------------------------------------------
+        a = 0.0
+        alpha = 0.0
+
+        if action == 0:   # turn left
+            alpha = +self.P.torque_accel
+            # Turning step: rotate in place, apply drag to v (no translation)
+            self.w = float(np.clip(self.w + (alpha - self.P.ang_drag * self.w) * dt,
+                                   -self.P.w_max, self.P.w_max))
+            self.theta = self._wrap_angle(self.theta + self.w * dt)
+            self.v = float(np.clip(self.v + (-self.P.lin_drag * self.v) * dt,
+                                   0.0, self.P.v_max))
+            # no x,y update on this step
+
+        elif action == 1:  # turn right
+            alpha = -self.P.torque_accel
+            self.w = float(np.clip(self.w + (alpha - self.P.ang_drag * self.w) * dt,
+                                   -self.P.w_max, self.P.w_max))
+            self.theta = self._wrap_angle(self.theta + self.w * dt)
+            self.v = float(np.clip(self.v + (-self.P.lin_drag * self.v) * dt,
+                                   0.0, self.P.v_max))
+            # no x,y update on this step
+
+        elif action == 2:  # accelerate straight
+            a = +self.P.thrust_accel
+            # Move step: heading locked, no turn
+            self.w = 0.0
+            self.v = float(np.clip(self.v + (a - self.P.lin_drag * self.v) * dt,
+                                   0.0, self.P.v_max))
+            self.x += self.v * math.cos(self.theta) * dt
+            self.y += self.v * math.sin(self.theta) * dt
+
+        elif action == 3:  # brake straight
+            a = -self.P.brake_accel
+            self.w = 0.0
+            self.v = float(np.clip(self.v + (a - self.P.lin_drag * self.v) * dt,
+                                   0.0, self.P.v_max))
+            self.x += self.v * math.cos(self.theta) * dt
+            self.y += self.v * math.sin(self.theta) * dt
 
         # Trail
         self._trail.append((self.x, self.y))
@@ -284,20 +299,17 @@ class ShipEnv(gym.Env):
 
         self.steps += 1
 
-        # Distances
+        # Distances / termination
         dist_goal = float(np.linalg.norm([self.x - self.goal[0], self.y - self.goal[1]]))
-
-        # Check rock collision
         destroyed = self._check_rock_collision(self.x, self.y)
 
-        # Reward / termination
-        control_cost = 0.01 * (tx_dir * tx_dir + rz_dir * rz_dir)
-        reward = -dist_goal - control_cost
-        terminated = False
+        # Shaping + small action cost
+        reward = -dist_goal - 0.01
 
+        terminated = False
         if destroyed:
             reward += self.P.crash_penalty
-            terminated = True  # ship destroyed
+            terminated = True
 
         reached = (dist_goal <= self.P.goal_radius) and not destroyed
         if reached:
@@ -384,7 +396,7 @@ class ShipEnv(gym.Env):
                     continue
                 if not far_enough(rx, ry, float(self.goal[0]), float(self.goal[1]), clear):
                     continue
-                # keep rocks from overlapping too much with each other
+                # keep rocks separated
                 ok = True
                 for (ox, oy) in rocks:
                     if not far_enough(rx, ry, ox, oy, max(sep, 2 * rr * 0.9)):
@@ -395,7 +407,7 @@ class ShipEnv(gym.Env):
                     placed = True
                     break
             if not placed:
-                # if we can't place respecting constraints, relax and place anywhere inside
+                # fallback: place anywhere inside
                 rx = float(rng.uniform(min_xy, max_xy))
                 ry = float(rng.uniform(min_xy, max_xy))
                 rocks.append((rx, ry))
@@ -419,7 +431,7 @@ class ShipEnv(gym.Env):
         pad = self.G.render_padding_px
         L = self.P.world_size
         sx = pad + int((x + L) * s)
-        sy = pad + int((L - y) * s)  # invert y
+        sy = pad + int((L - y) * s)  # invert y for screen coords
         return sx, sy
 
     def _build_water(self, surf: pygame.Surface):
@@ -445,12 +457,48 @@ class ShipEnv(gym.Env):
         for d in range(-h, w, step):
             pygame.draw.aaline(surf, highlight, (d, 0), (d + h, h))
 
+    def _handle_input(self):
+        """Process window events and live calibration keys."""
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.close()
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_LEFTBRACKET:    # '['
+                    self.G.sprite_heading_deg_offset -= 5.0
+                    print(f"sprite_heading_deg_offset = {self.G.sprite_heading_deg_offset}")
+                elif event.key == pygame.K_RIGHTBRACKET: # ']'
+                    self.G.sprite_heading_deg_offset += 5.0
+                    print(f"sprite_heading_deg_offset = {self.G.sprite_heading_deg_offset}")
+                elif event.key == pygame.K_LEFT:
+                    x, y = self.G.sprite_px_offset
+                    self.G.sprite_px_offset = (x - 1, y)
+                    print(f"sprite_px_offset = {self.G.sprite_px_offset}")
+                elif event.key == pygame.K_RIGHT:
+                    x, y = self.G.sprite_px_offset
+                    self.G.sprite_px_offset = (x + 1, y)
+                    print(f"sprite_px_offset = {self.G.sprite_px_offset}")
+                elif event.key == pygame.K_UP:
+                    x, y = self.G.sprite_px_offset
+                    self.G.sprite_px_offset = (x, y - 1)
+                    print(f"sprite_px_offset = {self.G.sprite_px_offset}")
+                elif event.key == pygame.K_DOWN:
+                    x, y = self.G.sprite_px_offset
+                    self.G.sprite_px_offset = (x, y + 1)
+                    print(f"sprite_px_offset = {self.G.sprite_px_offset}")
+                elif event.key == pygame.K_v:
+                    self.G.show_velocity_vector = not self.G.show_velocity_vector
+                    print(f"show_velocity_vector = {self.G.show_velocity_vector}")
+                elif event.key == pygame.K_0:
+                    self.G.sprite_heading_deg_offset = 0.0
+                    self.G.sprite_px_offset = (0, 0)
+                    print("sprite_heading_deg_offset=0, sprite_px_offset=(0,0)")
+
     def _draw_water(self):
         if not self._water_surf:
             return
+        # static by default; enable scroll by raising water_scroll_px_per_step
         self._water_offset = (self._water_offset + self.G.water_scroll_px_per_step) % self._win_h
         off = self._water_offset
-        # two blits for seamless vertical wrap
         self._surf.blit(self._water_surf, (0, off - self._win_h))
         self._surf.blit(self._water_surf, (0, off))
 
@@ -476,31 +524,38 @@ class ShipEnv(gym.Env):
             pygame.draw.circle(surf, self.G.rock_stroke, (sx, sy), r_px, 2)
 
     def _draw_ship(self, surf):
+        cx, cy = self._world_to_screen(self.x, self.y)
+
         if self._sprite_img_scaled is not None:
-            angle_deg = -math.degrees(self.theta)  # pygame rotates clockwise
+            # pygame rotates clockwise; our theta increases CCW
+            angle_deg = -math.degrees(self.theta) + self.G.sprite_heading_deg_offset
             img = pygame.transform.rotozoom(self._sprite_img_scaled, angle_deg, 1.0)
             rect = img.get_rect()
-            cx, cy = self._world_to_screen(self.x, self.y)
-            rect.center = (cx, cy)
+            rect.center = (cx + self.G.sprite_px_offset[0], cy + self.G.sprite_px_offset[1])
             surf.blit(img, rect)
-            return
+        else:
+            # fallback triangle (nose points +x when theta=0)
+            Lb = self.G.ship_length_m
+            Wb = self.G.ship_width_m
+            body = np.array([[+0.5 * Lb, 0.0], [-0.5 * Lb, +0.5 * Wb], [-0.5 * Lb, -0.5 * Wb]])
+            c, s = math.cos(self.theta), math.sin(self.theta)
+            R = np.array([[c, -s], [s, c]])
+            world = (R @ body.T).T + np.array([self.x, self.y])
+            pts = [self._world_to_screen(px, py) for (px, py) in world]
+            pygame.draw.polygon(surf, (30, 144, 255), pts)
+            pygame.draw.polygon(surf, (0, 60, 120), pts, 2)
 
-        # fallback triangle
-        Lb = self.G.ship_length_m
-        Wb = self.G.ship_width_m
-        body = np.array([[+0.5 * Lb, 0.0], [-0.5 * Lb, +0.5 * Wb], [-0.5 * Lb, -0.5 * Wb]])
-        c, s = math.cos(self.theta), math.sin(self.theta)
-        R = np.array([[c, -s], [s, c]])
-        world = (R @ body.T).T + np.array([self.x, self.y])
-        pts = [self._world_to_screen(px, py) for (px, py) in world]
-        pygame.draw.polygon(surf, (30, 144, 255), pts)
-        pygame.draw.polygon(surf, (0, 60, 120), pts, 2)
+        # Optional velocity vector for debugging alignment
+        if self.G.show_velocity_vector and self.v > 1e-6:
+            arrow_len = max(10, int(self.v * self.G.render_scale_px_per_m * 0.3))
+            tip_x = cx + int(arrow_len * math.cos(self.theta))
+            tip_y = cy - int(arrow_len * math.sin(self.theta))  # minus because screen y is inverted
+            pygame.draw.line(surf, (0, 0, 0), (cx, cy), (tip_x, tip_y), 2)
+            pygame.draw.circle(surf, (0, 0, 0), (tip_x, tip_y), 3)
 
     def _render_frame(self):
-        # keep window responsive
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.close()
+        # handle window + live calibration input
+        self._handle_input()
 
         if self._surf is None:
             self._surf = pygame.Surface((self._win_w, self._win_h)).convert()
@@ -509,7 +564,9 @@ class ShipEnv(gym.Env):
         self._surf.fill(self.G.water_primary)
         self._draw_water()
 
-        # overlays: rocks first (so ship sits above)
+        # overlays
+        if self.G.show_grid:
+            self._draw_grid(self._surf)
         self._draw_rocks(self._surf)
         self._draw_goal(self._surf)
         self._draw_trail(self._surf)
@@ -530,7 +587,7 @@ class ShipEnv(gym.Env):
 
         return None
 
-    # (optional) if you ever toggle show_grid=True
+    # (optional) grid if you ever want it back
     def _draw_grid(self, surf):
         L = self.P.world_size
         s = self.G.render_scale_px_per_m
@@ -544,4 +601,4 @@ class ShipEnv(gym.Env):
             x1, _ = self._world_to_screen(i, 0)
             pygame.draw.line(surf, (235, 235, 235), (x1, pad), (x1, pad + 2 * L * s), 1)
             _, y1 = self._world_to_screen(0, i)
-            pygame.draw.line(surf, (235, 235, 235), (pad, y1), (pad + 2 * L * s, y1), 1)
+            pygame.draw.line(surf, (235, 235, 235), (pad, y1), (pad + 2 * L * s), 1)

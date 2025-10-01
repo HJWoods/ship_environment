@@ -8,3 +8,8 @@ ships that move towards a random waypoint(s), then stop.
 Ships that chase the main ship?
 slight drift to rocks?
 wind speed/direction, which changes over the course of the episode? Ship can detect this
+add image to readme, or gif
+create pip package for environment
+add better sprites
+
+vectorize? https://gymnasium.farama.org/introduction/speed_up_env/
