@@ -1,0 +1,18 @@
+[project]
+name = "shipenv"
+version = "0.1.0"
+description = "Ship env for gymnasium"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["gymnasium", "numpy"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# pyproject.toml
+[tool.hatch.build]
+include = [
+  "shipenv/**.py",
+  "shipenv/assets/ship.png",
+]
