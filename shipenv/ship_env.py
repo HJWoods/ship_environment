@@ -23,12 +23,12 @@ class ShipParams:
     world_size: float = 10.0
 
     # Control (accelerations, not velocities)
-    thrust_accel: float = 1.5       # m/s^2 (forward/back along body x)
-    torque_accel: float = 2.0       # rad/s^2 (left/right yaw)
+    thrust_accel: float = 0.15       # m/s^2 (forward/back along body x)
+    torque_accel: float = 0.2       # rad/s^2 (left/right yaw)
 
     # Limits
-    v_max: float = 2.5             # m/s
-    w_max: float = 2.0              # rad/s
+    v_max: float = 5.0              # m/s
+    w_max: float = 1.0              # rad/s
 
     # Drag
     lin_drag: float = 0.1           # linear drag coeff on v
@@ -43,7 +43,7 @@ class ShipParams:
     # Rocks (hazards)
     num_rocks: int = 6
     rock_radius: float = 0.5
-    rock_clearance: float = 1.2     # min distance from start & goal
+    rock_clearance: float = 1.2       # min distance from start & goal (center-to-center)
     rock_min_separation: float = 1.0  # min distance between rocks
 
     # Rewards
@@ -72,7 +72,7 @@ class GraphicsParams:
 
     # Trail
     trail_len: int = 100
-    trail_color: Tuple[int, int, int] = (127, 0, 0)
+    trail_color: Tuple[int, int, int] = (160, 160, 255)
 
     # FPS (human mode)
     fps_limit: int = 60
@@ -89,7 +89,7 @@ class GraphicsParams:
     goal_color: Tuple[int, int, int] = (0, 180, 0)
 
     # Optional overlays
-    show_grid: bool = False  # off by default
+    show_grid: bool = False  # left in, but off by default
 
 
 class ShipEnv(gym.Env):
@@ -98,6 +98,9 @@ class ShipEnv(gym.Env):
       - Action: 9 discrete combinations of (thrust, torque) in {-1,0,1}^2
       - State:  x, y, θ, v_forward, ω
       - Obs:    [x, y, cosθ, sinθ, v, ω]
+
+    Kinematics:
+      - Exact unicycle integration (no lateral/slip dof): ship moves only along its body x-axis.
 
     Hazards:
       - Static circular rocks (configurable count/radius). Touching a rock ends the episode with a penalty.
@@ -142,7 +145,6 @@ class ShipEnv(gym.Env):
         # State
         self.x = self.y = self.theta = 0.0
         self.v = self.w = 0.0
-        # If goal was passed here, use it as initial default; reset() may randomize/override
         self.goal = np.array(goal if goal is not None else [0.0, 0.0], dtype=np.float32)
         self.steps = 0
 
@@ -249,17 +251,31 @@ class ShipEnv(gym.Env):
         a = tx_dir * self.P.thrust_accel
         alpha = rz_dir * self.P.torque_accel
 
-        # Drag
+        # Apply drag to accelerations (first-order viscous)
         a -= self.P.lin_drag * self.v
         alpha -= self.P.ang_drag * self.w
 
-        # Integrate
+        # Integrate velocities
         self.v = float(np.clip(self.v + a * self.P.dt, -self.P.v_max, self.P.v_max))
         self.w = float(np.clip(self.w + alpha * self.P.dt, -self.P.w_max, self.P.w_max))
 
-        self.theta = self._wrap_angle(self.theta + self.w * self.P.dt)
-        self.x += self.v * math.cos(self.theta) * self.P.dt
-        self.y += self.v * math.sin(self.theta) * self.P.dt
+        # ---- Exact unicycle integration (no sideways motion) ----
+        # x_dot = v cosθ,  y_dot = v sinθ,  θ_dot = w  (v, w constant over dt)
+        v = self.v
+        w = self.w
+        dt = self.P.dt
+        theta0 = self.theta
+        if abs(w) < 1e-9:
+            # Straight line
+            self.x += v * math.cos(theta0) * dt
+            self.y += v * math.sin(theta0) * dt
+            self.theta = self._wrap_angle(theta0 + w * dt)
+        else:
+            # Constant turn rate arc
+            self.x += (v / w) * (math.sin(theta0 + w * dt) - math.sin(theta0))
+            self.y += -(v / w) * (math.cos(theta0 + w * dt) - math.cos(theta0))
+            self.theta = self._wrap_angle(theta0 + w * dt)
+        # ---------------------------------------------------------
 
         # Trail
         self._trail.append((self.x, self.y))
@@ -513,3 +529,19 @@ class ShipEnv(gym.Env):
             return np.transpose(arr, (1, 0, 2)).copy()  # HxWx3
 
         return None
+
+    # (optional) if you ever toggle show_grid=True
+    def _draw_grid(self, surf):
+        L = self.P.world_size
+        s = self.G.render_scale_px_per_m
+        pad = self.G.render_padding_px
+        rect = pygame.Rect(pad, pad, 2 * L * s, 2 * L * s)
+        pygame.draw.rect(surf, (200, 200, 200), rect, 2)
+        cx, cy = self._world_to_screen(0, 0)
+        pygame.draw.line(surf, (220, 220, 220), (pad, cy), (pad + 2 * L * s, cy), 1)
+        pygame.draw.line(surf, (220, 220, 220), (cx, pad), (cx, pad + 2 * L * s), 1)
+        for i in range(-int(L), int(L) + 1):
+            x1, _ = self._world_to_screen(i, 0)
+            pygame.draw.line(surf, (235, 235, 235), (x1, pad), (x1, pad + 2 * L * s), 1)
+            _, y1 = self._world_to_screen(0, i)
+            pygame.draw.line(surf, (235, 235, 235), (pad, y1), (pad + 2 * L * s, y1), 1)

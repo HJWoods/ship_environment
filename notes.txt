@@ -1,0 +1,10 @@
+To do:
+add multiple waypoints
+raycasting, configurable number of rays, detects both rocks and ships and the edge of the screen though not goal.
+(maybe draw a wall around the screen so clear that it's an obstacle)
+
+add ships which just move backwards and forwards
+ships that move towards a random waypoint(s), then stop.
+Ships that chase the main ship?
+slight drift to rocks?
+wind speed/direction, which changes over the course of the episode? Ship can detect this
