@@ -16,8 +16,8 @@ import importlib.resources as ir
 @dataclass
 class ShipParams:
     # Simulation
-    dt: float = 0.1                 # seconds per step (will be overridden in fast mode)
-    max_steps: int = 5000
+    dt: float = 0.1                 # seconds per step
+    max_steps: int = 250
 
     # World bounds (square [-L, L] x [-L, L])
     world_size: float = 10.0
@@ -48,12 +48,41 @@ class ShipParams:
     rock_min_separation: float = 1.0  # min distance between rocks
 
     # Rewards
-    success_bonus: float = 10.0
-    crash_penalty: float = -10.0     # penalty when hitting a rock
+    success_bonus: float = 100.0
+    crash_penalty: float = -100.0     # penalty when hitting a rock or AI ship
 
     # ---- Raycasting (does NOT affect physics) ----
-    num_rays: int = 8                 # 0 keeps old 5-D observation
+    num_rays: int = 8                 # 0 keeps old observation without rays
     include_goal_in_rays: bool = False  # treat goal as a hit (small radius) if True
+
+    # Ship-ship collision model (for AI collision with player & ray hits)
+    ship_radius: float = 0.3
+
+
+# =========================
+# AI Parameters
+# =========================
+@dataclass
+class AIParams:
+    # Toggles
+    enable_backforth: bool = True
+    enable_waypoints: bool = True
+    enable_chasers: bool = True
+
+    # Counts (default 1 of each)
+    num_backforth: int = 1
+    num_waypoints: int = 1
+    num_chasers: int = 1
+
+    # Behavior tuning
+    backforth_min_len: float = 3.0
+    backforth_max_len: float = 6.0
+    waypoint_count_min: int = 3   # will choose 3–4 far-apart waypoints
+    waypoint_count_max: int = 4
+    waypoint_stop_radius: float = 0.25
+
+    # Simple speed preference for AI (they use same physics)
+    pref_speed: float = 0.16
 
 
 # =========================
@@ -70,14 +99,14 @@ class GraphicsParams:
     ship_width_m: float = 0.35
 
     # Water look & feel
-    water_primary: Tuple[int, int, int] = (120, 170, 220)   # base color
-    water_secondary: Tuple[int, int, int] = (90, 140, 200)  # darker streaks
+    water_primary: Tuple[int, int, int] = (120, 170, 220)
+    water_secondary: Tuple[int, int, int] = (90, 140, 200)
     water_wave_px: int = 24
-    water_scroll_px_per_step: int = 0   # keep static to avoid visual drift illusions
+    water_scroll_px_per_step: int = 0
 
     # Trail
     trail_len: int = 100
-    trail_color: Tuple[int, int, int] = (160, 160, 255)
+    trail_color: Tuple[int, int, int] = (127, 0, 0)
 
     # FPS (human mode)
     fps_limit: int = 60
@@ -87,12 +116,12 @@ class GraphicsParams:
     sprite_meters_long: float = 0.9
 
     # Sprite alignment tweaks
-    sprite_heading_deg_offset: float = 0.0           # rotate sprite to match physics heading
-    sprite_px_offset: Tuple[int, int] = (0, 0)       # post-rotation pixel nudge (x,y)
+    sprite_heading_deg_offset: float = 0.0
+    sprite_px_offset: Tuple[int, int] = (0, 0)
 
     # Debug overlays
-    show_velocity_vector: bool = False               # draw a small v arrow
-    show_debug_triangle: bool = False                # draw fallback triangle under sprite for orientation comparison
+    show_velocity_vector: bool = False
+    show_debug_triangle: bool = False
 
     # Rays (debug rendering)
     show_rays: bool = False
@@ -107,7 +136,12 @@ class GraphicsParams:
     goal_color: Tuple[int, int, int] = (0, 180, 0)
 
     # Optional overlays
-    show_grid: bool = False  # off by default
+    show_grid: bool = False
+
+    # AI ship colors
+    ai_backforth_color: Tuple[int, int, int] = (230, 160, 50)
+    ai_waypoint_color:  Tuple[int, int, int] = (80, 200, 120)
+    ai_chaser_color:    Tuple[int, int, int] = (200, 80, 80)
 
 
 class ShipEnv(gym.Env):
@@ -115,24 +149,32 @@ class ShipEnv(gym.Env):
     No lateral slip. One action per step; turning and moving are exclusive.
 
     Action space: Discrete(4)
-        0: Turn left    (angular acceleration +torque_accel)  -> rotate in place this step
-        1: Turn right   (angular acceleration -torque_accel)  -> rotate in place this step
-        2: Accelerate   (linear acceleration +thrust_accel)   -> translate straight, no turning
-        3: Brake        (linear acceleration -brake_accel)    -> translate straight, no turning; v>=0
+        0: Turn left
+        1: Turn right
+        2: Accelerate
+        3: Brake
 
     Kinematics (unchanged):
-        * Turn steps (0/1): rotate direction unit (dx,dy) by ±torque*dt; drag on v; no x,y move.
+        * Turn steps (0/1): rotate (dx,dy) by ±torque*dt; drag on v; no x,y move.
         * Move steps (2/3): lock rotation; update v; move x+=v*dx*dt, y-=v*dy*dt.
-        * v ∈ [0, v_max], no reverse. (dx,dy) is the ship's heading unit vector.
+        * v ∈ [0, v_max], no reverse.
 
-    Rendering controls (added while keeping 't' semantics):
-        [ / ] : sprite heading offset ±5°
-        Arrow keys : sprite pixel nudge
-        V : toggle velocity vector
-        T : toggle debug triangle AND rays together
-        0 : reset sprite offsets
+    Observation:
+        [x, y, dx, dy, v, goal_x, goal_y] + (optional rays)
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
+
+    __slots__ = (
+        "P","G","AI","render_mode","_render_on","_fast_headless",
+        "action_space","observation_space",
+        "x","y","v","dx","dy","goal","steps","rocks",
+        "_screen","_clock","_surf","_water_surf","_water_offset",
+        "_sprite_img","_sprite_img_scaled","_trail","_obs_buf",
+        "_ray_dirs","_last_ray_ds","_world_px","_win_w","_win_h",
+        "_dt","_vmax","_lin_drag_dt","_thrust_dt","_brake_dt",
+        "_cos_rot","_sin_rot","_neg_sin_rot",
+        "_ai_ships"
+    )
 
     def __init__(
         self,
@@ -140,25 +182,26 @@ class ShipEnv(gym.Env):
         graphics: Optional[GraphicsParams] = None,
         render_mode: Optional[str] = None,
         goal: Optional[Tuple[float, float]] = None,
+        ai: Optional[AIParams] = None,
     ):
         super().__init__()
         self.P = params or ShipParams()
         self.G = graphics or GraphicsParams()
+        self.AI = ai or AIParams()
         self.render_mode = render_mode
 
         # Flags for rendering / headless
         self._render_on = render_mode in ("human", "rgb_array")
-        self._fast_headless = not self._render_on  # True when render_mode is None
+        self._fast_headless = not self._render_on
 
-        # Discrete(4) actions (see docstring)
+        # Discrete(4) actions
         self.action_space = spaces.Discrete(4)
 
-        # ----- Observation space: [x, y, dx, dy, v] + (optional rays) -----
+        # Observation space: [x, y, dx, dy, v, goal_x, goal_y] + (optional rays)
         L = self.P.world_size
-        base_low  = [-L, -L, -1.0, -1.0, 0.0]
-        base_high = [ L,  L,  1.0,  1.0, self.P.v_max]
+        base_low  = [-L, -L, -1.0, -1.0, 0.0, -2*L, -2*L]
+        base_high = [ L,  L,  1.0,  1.0, self.P.v_max, 2*L, 2*L]
 
-        # Each ray distance ∈ [0, 2√2 L] (corner-to-corner upper bound)
         if self.P.num_rays > 0:
             ray_high = 2.0 * math.sqrt(2.0) * L
             base_low  += [0.0] * self.P.num_rays
@@ -172,9 +215,9 @@ class ShipEnv(gym.Env):
 
         # State
         self.x = self.y = 0.0
-        self.v = 0.0   # scalar speed (always >= 0)
-        self.dx = 1.0  # direction unit vector x component
-        self.dy = 0.0  # direction unit vector y component
+        self.v = 0.0
+        self.dx = 1.0
+        self.dy = 0.0
         self.goal = np.array(goal if goal is not None else [0.0, 0.0], dtype=np.float32)
         self.steps = 0
 
@@ -185,16 +228,21 @@ class ShipEnv(gym.Env):
         self._screen = None
         self._clock = None
         self._surf = None
+        a = self.G.render_scale_px_per_m
+        pad = self.G.render_padding_px
+        self._world_px = int(2 * L * a)
+        self._win_w = self._world_px + 2 * pad
+        self._win_h = self._world_px + 2 * pad
         self._water_surf = None
         self._water_offset = 0
         self._sprite_img = None
         self._sprite_img_scaled = None
         self._trail: List[Tuple[float, float]] = []
 
-        # Preallocated observation buffer
-        self._obs_buf = np.zeros(5 + max(0, self.P.num_rays), dtype=np.float32)
+        # Preallocated observation buffer (7 base dims + rays)
+        self._obs_buf = np.zeros(7 + max(0, self.P.num_rays), dtype=np.float32)
 
-        # Precompute ray directions (global bearings: 0..2π)
+        # Precompute ray directions
         self._ray_dirs: List[Tuple[float, float]] = []
         if self.P.num_rays > 0:
             two_pi = 2.0 * math.pi
@@ -205,26 +253,39 @@ class ShipEnv(gym.Env):
         # Cache of last ray distances for rendering
         self._last_ray_ds = np.zeros(self.P.num_rays, dtype=np.float32) if self.P.num_rays > 0 else None
 
-        # Pixel geometry
-        s = self.G.render_scale_px_per_m
-        pad = self.G.render_padding_px
-        self._world_px = int(2 * L * s)
-        self._win_w = self._world_px + 2 * pad
-        self._win_h = self._world_px + 2 * pad
+        # AI ships list
+        self._ai_ships: List[dict] = []
+
+        # Cache step constants
+        self._refresh_step_consts()
+
+    # Cache constants derived from params/dt to reduce per-step overhead
+    def _refresh_step_consts(self):
+        dt = self.P.dt
+        self._dt = dt
+        self._vmax = self.P.v_max
+        self._lin_drag_dt = self.P.lin_drag * dt
+        self._thrust_dt   = self.P.thrust_accel * dt
+        self._brake_dt    = self.P.brake_accel  * dt
+        ang = self.P.torque_accel * dt
+        self._cos_rot = math.cos(ang)
+        self._sin_rot = math.sin(ang)
+        self._neg_sin_rot = -self._sin_rot
 
     # -------------------
     # Gym API
     # -------------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        self._refresh_step_consts()
         rng = np.random.default_rng(seed)
         L = self.P.world_size
 
-        # Start pose/speeds (PHYSICS UNCHANGED)
+        # Start pose/speeds
         self.x = float(-0.5 * L + rng.normal(0, self.P.start_noise))
         self.y = float(rng.normal(0, self.P.start_noise))
-        self.v = max(0.0, float(rng.normal(0, 0.1)))  # non-negative
-        self.dx = 1.0  # start facing +x direction
+        self.v = max(0.0, float(rng.normal(0, 0.1)))
+        self.dx = 1.0
         self.dy = 0.0
         self.steps = 0
 
@@ -240,14 +301,24 @@ class ShipEnv(gym.Env):
         # Rocks
         self.rocks = self._sample_rocks(rng)
 
+        # AI spawn
+        self._spawn_ai(rng)
+
         # Rendering setup - only if rendering enabled
         if self._render_on:
             if not pygame.get_init():
                 pygame.init()
             if self.render_mode == "human":
                 if self._screen is None:
-                    pygame.display.set_caption("ShipEnv")
-                    self._screen = pygame.display.set_mode((self._win_w, self._win_h))
+                    try:
+                        pygame.display.set_caption("ShipEnv")
+                        self._screen = pygame.display.set_mode((self._win_w, self._win_h))
+                    except pygame.error as e:
+                        print(f"Warning: Could not initialize display: {e}")
+                        print("Falling back to headless mode")
+                        self.render_mode = None
+                        self._render_on = False
+                        return self._obs(), {"goal": self.goal.copy(), "rocks": list(self.rocks)}
                 if self._clock is None:
                     self._clock = pygame.time.Clock()
             self._surf = pygame.Surface((self._win_w, self._win_h)).convert()
@@ -294,68 +365,10 @@ class ShipEnv(gym.Env):
         if action not in (0, 1, 2, 3):
             raise ValueError("Invalid action for Discrete(4).")
 
-        dt = self.P.dt
-        lin_drag = self.P.lin_drag
-        ang_drag = self.P.ang_drag
-        v_max = self.P.v_max
-        w_max = self.P.w_max
-        thrust = self.P.thrust_accel
-        brake = self.P.brake_accel
-        torque = self.P.torque_accel
-
-        # Local refs for speed
-        x = self.x
-        y = self.y
-        v = self.v
-        dx = self.dx
-        dy = self.dy
-
-        # ---- PHYSICS UNCHANGED BELOW ----
-        if action == 0:   # turn left
-            # Rotate direction vector left by torque amount
-            angle_change = torque * dt
-            cos_angle = math.cos(angle_change)
-            sin_angle = math.sin(angle_change)
-            new_dx = dx * cos_angle + dy * sin_angle
-            new_dy = -dx * sin_angle + dy * cos_angle
-            dx, dy = new_dx, new_dy
-            v -= (lin_drag * v) * dt
-            if v < 0.0:
-                v = 0.0
-
-        elif action == 1:  # turn right
-            # Rotate direction vector right by torque amount
-            angle_change = -torque * dt
-            cos_angle = math.cos(angle_change)
-            sin_angle = math.sin(angle_change)
-            new_dx = dx * cos_angle + dy * sin_angle
-            new_dy = -dx * sin_angle + dy * cos_angle
-            dx, dy = new_dx, new_dy
-            v -= (lin_drag * v) * dt
-            if v < 0.0:
-                v = 0.0
-
-        elif action == 2:  # accelerate in ship direction
-            v += (thrust - lin_drag * v) * dt
-            if v > v_max:
-                v = v_max
-
-        elif action == 3:  # brake in ship direction
-            v += (-brake - lin_drag * v) * dt
-            if v < 0.0:
-                v = 0.0
-
-        # Update position: apply velocity in ship's direction
-        x += v * dx * dt
-        y -= v * dy * dt  # screen-inverted Y convention
-        # ---- END PHYSICS ----
-
-        # Commit locals back to state
-        self.x = x
-        self.y = y
-        self.v = v
-        self.dx = dx
-        self.dy = dy
+        # --- Player physics (unchanged) using cached-step constants ---
+        x, y, dx, dy, v = self.x, self.y, self.dx, self.dy, self.v
+        x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, action)
+        self.x, self.y, self.dx, self.dy, self.v = x, y, dx, dy, v
 
         # Trail (rendering only)
         if self._render_on:
@@ -365,14 +378,19 @@ class ShipEnv(gym.Env):
 
         self.steps += 1
 
-        # Distances / termination (use math.hypot for speed)
+        # Distances / termination
         dxg = x - float(self.goal[0])
         dyg = y - float(self.goal[1])
         dist_goal = math.hypot(dxg, dyg)
-        destroyed = self._check_rock_collision(x, y)
+        destroyed = self._check_rock_collision(x, y)  # player vs rocks only
 
-        # Shaping + small action cost
-        reward = -dist_goal - 0.01
+        reward = 0
+        # If not moving, penalize
+        if self.v < 0.01:
+            reward -= 0.5
+
+        # Reward based on distance to goal
+        reward -= dist_goal * 0.1
 
         terminated = False
         if destroyed:
@@ -386,6 +404,12 @@ class ShipEnv(gym.Env):
 
         out_of_bounds = (abs(x) > self.P.world_size or abs(y) > self.P.world_size)
         truncated = out_of_bounds or (self.steps >= self.P.max_steps)
+
+        # --- Advance AI and check player-vs-AI collision (AI ignore rocks) ---
+        self._step_ai()
+        if not terminated and self._check_ai_collision_with_player():
+            reward += self.P.crash_penalty
+            terminated = True
 
         info = {
             "distance": dist_goal,
@@ -423,52 +447,95 @@ class ShipEnv(gym.Env):
     # -------------------
     def _obs(self):
         buf = self._obs_buf
-        # Base state
+        # base features
         buf[0] = self.x
         buf[1] = self.y
         buf[2] = self.dx
         buf[3] = self.dy
         buf[4] = self.v
-
-        # Rays appended after base (does not affect physics)
+        # goal relative position
+        buf[5] = float(self.goal[0] - self.x)
+        buf[6] = float(self.goal[1] - self.y)
+        # rays (if any)
         if self.P.num_rays > 0:
-            self._compute_rays_into(buf, offset=5)
-
+            self._compute_rays_into(buf, offset=7)
         return buf
 
-    @staticmethod
-    def _wrap_angle(a):
-        return (a + math.pi) % (2 * math.pi) - math.pi
+    # Physics application used by both player and AI (logic unchanged)
+    def _apply_action(self, x, y, dx, dy, v, action):
+        dt = self._dt
+        v_max = self._vmax
+        lin_drag_dt = self._lin_drag_dt
+        thrust_dt = self._thrust_dt
+        brake_dt = self._brake_dt
+        c = self._cos_rot
+        s = self._sin_rot
+        ns = self._neg_sin_rot
+
+        if action == 0:   # turn left
+            ndx = dx * c + dy * s
+            ndy = -dx * s + dy * c
+            dx, dy = ndx, ndy
+            v -= lin_drag_dt * v
+            if v < 0.0:
+                v = 0.0
+        elif action == 1:  # turn right
+            ndx = dx * c + dy * ns
+            ndy = -dx * ns + dy * c
+            dx, dy = ndx, ndy
+            v -= lin_drag_dt * v
+            if v < 0.0:
+                v = 0.0
+        elif action == 2:  # accelerate
+            v += thrust_dt - lin_drag_dt * v
+            if v > v_max:
+                v = v_max
+        else:  # 3: brake
+            v += -brake_dt - lin_drag_dt * v
+            if v < 0.0:
+                v = 0.0
+
+        x += v * dx * dt
+        y -= v * dy * dt
+        return x, y, dx, dy, v
 
     # --- Raycasting (geometry only; no physics effects) ---
     def _compute_rays_into(self, out: np.ndarray, offset: int):
-        """
-        Cast num_rays global-bearing rays from (x,y) and write distances into out[offset:].
-        Distances are to nearest rock circle; if none, distance to the world boundary.
-        Optionally treat goal as a small circle if include_goal_in_rays=True.
-        """
         if not self._ray_dirs:
             return
         x0 = self.x
         y0 = self.y
         L = self.P.world_size
         rr = self.P.rock_radius
+        ship_r = self.P.ship_radius
         min_x = -L; max_x = +L
         min_y = -L; max_y = +L
 
         include_goal = self.P.include_goal_in_rays
-        r2 = rr * rr
+        r2_rock = rr * rr
+        r2_ship = ship_r * ship_r
 
-        for i, (dx, dy) in enumerate(self._ray_dirs):
+        ray_dirs = self._ray_dirs
+        rocks = self.rocks
+        last_ray = self._last_ray_ds
+        ai = self._ai_ships
+
+        for i, (dx, dy) in enumerate(ray_dirs):
             # Distance to box edges
             t_edge = self._ray_to_box(x0, y0, dx, dy, min_x, max_x, min_y, max_y)
 
-            # Nearest rock hit
+            # Nearest object: rocks or AI ships (treated as circles)
             t_obj = float('inf')
-            for (cx, cy) in self.rocks:
-                t = self._ray_circle_intersect(x0, y0, dx, dy, cx, cy, r2)
+            for (cx, cy) in rocks:
+                t = self._ray_circle_intersect(x0, y0, dx, dy, cx, cy, r2_rock)
                 if t is not None and 0.0 <= t < t_obj:
                     t_obj = t
+            if ai:
+                for s in ai:
+                    cx, cy = s["x"], s["y"]
+                    t = self._ray_circle_intersect(x0, y0, dx, dy, cx, cy, r2_ship)
+                    if t is not None and 0.0 <= t < t_obj:
+                        t_obj = t
 
             # Optional: goal as small target
             if include_goal:
@@ -480,26 +547,22 @@ class ShipEnv(gym.Env):
 
             d_hit = t_obj if t_obj < t_edge else t_edge
             out[offset + i] = d_hit
-            if self._last_ray_ds is not None:
-                self._last_ray_ds[i] = d_hit
+            if last_ray is not None:
+                last_ray[i] = d_hit
 
     @staticmethod
     def _ray_circle_intersect(px: float, py: float, dx: float, dy: float,
                               cx: float, cy: float, r2: float) -> Optional[float]:
-        """
-        Ray from P=(px,py) along D=(dx,dy) (unit) vs circle center C, radius^2=r2.
-        Returns the smallest non-negative t if hit, else None.
-        """
         mx = px - cx
         my = py - cy
-        b = mx * dx + my * dy            # dot(m, d)
-        c = mx * mx + my * my - r2       # dot(m,m) - r^2
+        b = mx * dx + my * dy
+        c = mx * mx + my * my - r2
 
         if c <= 0.0:
-            return 0.0                   # starting inside -> distance 0
+            return 0.0
 
         if b > 0.0:
-            return None                  # pointing away
+            return None
 
         disc = b * b - c
         if disc < 0.0:
@@ -511,10 +574,6 @@ class ShipEnv(gym.Env):
     @staticmethod
     def _ray_to_box(px: float, py: float, dx: float, dy: float,
                     min_x: float, max_x: float, min_y: float, max_y: float) -> float:
-        """
-        Distance along ray from (px,py) direction (dx,dy) to the AABB edges.
-        Returns the smallest positive t that lands on a valid boundary segment.
-        """
         candidates: List[float] = []
 
         if abs(dx) > 1e-12:
@@ -531,7 +590,6 @@ class ShipEnv(gym.Env):
         if not candidates:
             return float('inf')
 
-        # Prefer the first candidate that actually hits the box extent
         for t in sorted(candidates):
             if t <= 0.0:
                 continue
@@ -564,15 +622,13 @@ class ShipEnv(gym.Env):
                 rocks.append((rx, ry))
             return rocks
 
-        # Original complex rock placement for rendering mode
+        # Original placement for rendering mode
         rocks: List[Tuple[float, float]] = []
         L = self.P.world_size
         rr = self.P.rock_radius
         clear = max(self.P.rock_clearance, rr + 0.1)
         sep = max(self.P.rock_min_separation, 0.0)
         max_tries = 2000
-
-        # ensure we don't place outside the box considering radius & a tiny safety margin
         min_xy = -L + rr + 0.05
         max_xy = L - rr - 0.05
 
@@ -584,12 +640,10 @@ class ShipEnv(gym.Env):
             for _attempt in range(max_tries):
                 rx = float(rng.uniform(min_xy, max_xy))
                 ry = float(rng.uniform(min_xy, max_xy))
-                # keep rocks away from start and goal
                 if not far_enough(rx, ry, self.x, self.y, clear):
                     continue
                 if not far_enough(rx, ry, float(self.goal[0]), float(self.goal[1]), clear):
                     continue
-                # keep rocks separated
                 ok = True
                 for (ox, oy) in rocks:
                     if not far_enough(rx, ry, ox, oy, max(sep, 2 * rr * 0.9)):
@@ -600,7 +654,6 @@ class ShipEnv(gym.Env):
                     placed = True
                     break
             if not placed:
-                # fallback: place anywhere inside
                 rx = float(rng.uniform(min_xy, max_xy))
                 ry = float(rng.uniform(min_xy, max_xy))
                 rocks.append((rx, ry))
@@ -618,6 +671,151 @@ class ShipEnv(gym.Env):
                 return True
         return False
 
+    # -------------------
+    # AI: spawn / control / collisions
+    # -------------------
+    def _spawn_ai(self, rng: np.random.Generator):
+        self._ai_ships.clear()
+        if not (self.AI.enable_backforth or self.AI.enable_waypoints or self.AI.enable_chasers):
+            return
+
+        L = self.P.world_size
+        rr = max(self.P.rock_radius, self.P.ship_radius)
+        min_xy = -L + rr + 0.05
+        max_xy =  L - rr - 0.05
+
+        def rand_pos():
+            return float(rng.uniform(min_xy, max_xy)), float(rng.uniform(min_xy, max_xy))
+
+        # Back-and-forth ships
+        if self.AI.enable_backforth and self.AI.num_backforth > 0:
+            for _ in range(self.AI.num_backforth):
+                x0, y0 = rand_pos()
+                ang = rng.uniform(0, 2*math.pi)
+                seg_len = rng.uniform(self.AI.backforth_min_len, self.AI.backforth_max_len)
+                ux = math.cos(ang); uy = math.sin(ang)
+                x1 = x0 + 0.5 * seg_len * ux; y1 = y0 + 0.5 * seg_len * uy
+                x2 = x0 - 0.5 * seg_len * ux; y2 = y0 - 0.5 * seg_len * uy
+                self._ai_ships.append(dict(
+                    kind="bf",
+                    x=x1, y=y1, dx=ux, dy=uy, v=0.0,
+                    a=(x1, y1), b=(x2, y2), target="b"
+                ))
+
+        # Waypoint ships (3–4 waypoints far apart)
+        if self.AI.enable_waypoints and self.AI.num_waypoints > 0:
+            for _ in range(self.AI.num_waypoints):
+                x, y = rand_pos()
+                # choose count in [min, max]
+                n_wp = int(rng.integers(self.AI.waypoint_count_min, self.AI.waypoint_count_max + 1))
+                waypts: List[Tuple[float, float]] = []
+
+                # target pairwise separation: ~ half the world size
+                min_sep = 0.5 * L
+                tries = 0
+                while len(waypts) < n_wp and tries < 5000:
+                    tries += 1
+                    c = rand_pos()
+                    if all((c[0]-wx)**2 + (c[1]-wy)**2 >= (min_sep*min_sep) for (wx, wy) in waypts):
+                        waypts.append(c)
+
+                if not waypts:
+                    waypts = [rand_pos() for __ in range(n_wp)]  # fallback
+
+                self._ai_ships.append(dict(
+                    kind="wp",
+                    x=x, y=y, dx=1.0, dy=0.0, v=0.0,
+                    waypoints=waypts, idx=0, stopped=False
+                ))
+
+        # Chasers
+        if self.AI.enable_chasers and self.AI.num_chasers > 0:
+            for _ in range(self.AI.num_chasers):
+                x, y = rand_pos()
+                self._ai_ships.append(dict(
+                    kind="chase",
+                    x=x, y=y, dx=1.0, dy=0.0, v=0.0
+                ))
+
+    def _ai_pick_action_towards(self, sx, sy, sdx, sdy, tx, ty):
+        # Desired heading vector towards (tx,ty)
+        vx = tx - sx; vy = ty - sy
+        if vx*vx + vy*vy < 1e-12:
+            return 3  # brake
+        desired = math.atan2(-vy, vx)   # screen-inverted y matches integrator
+        cur = math.atan2(-sdy, sdx)
+        d = desired - cur
+        d = (d + math.pi) % (2*math.pi) - math.pi
+        if abs(d) > 1e-4:
+            return 0 if d > 0.0 else 1
+        return 2
+
+    def _step_ai(self):
+        if not self._ai_ships:
+            return
+        L = self.P.world_size
+        pref_v = self.AI.pref_speed
+        r = self.P.ship_radius
+
+        for s in self._ai_ships:
+            kind = s["kind"]
+            x, y, dx, dy, v = s["x"], s["y"], s["dx"], s["dy"], s["v"]
+
+            if kind == "bf":
+                ax, ay = s["a"]; bx, by = s["b"]
+                tgt = (bx, by) if s["target"] == "b" else (ax, ay)
+                act = self._ai_pick_action_towards(x, y, dx, dy, tgt[0], tgt[1])
+                x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, act)
+                # regulate speed
+                if v < pref_v * 0.98:
+                    x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, 2)
+                elif v > pref_v * 1.02:
+                    x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, 3)
+                # switch end when close
+                if (x - tgt[0])**2 + (y - tgt[1])**2 <= (r*r):
+                    s["target"] = "a" if s["target"] == "b" else "b"
+
+            elif kind == "wp":
+                if s["stopped"]:
+                    x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, 3)
+                else:
+                    tx, ty = s["waypoints"][s["idx"]]
+                    act = self._ai_pick_action_towards(x, y, dx, dy, tx, ty)
+                    x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, act)
+                    x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, 2)
+                    if (x - tx)**2 + (y - ty)**2 <= (self.AI.waypoint_stop_radius**2):
+                        if s["idx"] + 1 < len(s["waypoints"]):
+                            s["idx"] += 1
+                        else:
+                            s["stopped"] = True
+
+            else:  # "chase" — always target the PLAYER (x,y)
+                tx, ty = self.x, self.y
+                act = self._ai_pick_action_towards(x, y, dx, dy, tx, ty)
+                x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, act)
+                x, y, dx, dy, v = self._apply_action(x, y, dx, dy, v, 2)
+
+            # keep in bounds with simple reflect
+            if abs(x) > L:
+                x = max(-L, min(L, x))
+                dx = -dx
+            if abs(y) > L:
+                y = max(-L, min(L, y))
+                dy = -dy
+
+            s["x"], s["y"], s["dx"], s["dy"], s["v"] = x, y, dx, dy, v
+
+    def _check_ai_collision_with_player(self) -> bool:
+        if not self._ai_ships:
+            return False
+        r2 = (self.P.ship_radius * 2.0) ** 2
+        x, y = self.x, self.y
+        for s in self._ai_ships:
+            dx = x - s["x"]; dy = y - s["y"]
+            if dx*dx + dy*dy <= r2:
+                return True
+        return False
+
     # --- Rendering helpers
     def _world_to_screen(self, x, y):
         s = self.G.render_scale_px_per_m
@@ -628,14 +826,12 @@ class ShipEnv(gym.Env):
         return sx, sy
 
     def _build_water(self, surf: pygame.Surface):
-        """Pre-render simple wavy water texture onto `surf`."""
         w, h = surf.get_size()
         cell = self.G.water_wave_px
         base = self.G.water_primary
         dark = self.G.water_secondary
         surf.fill(base)
 
-        # Dark sine streaks
         import math as _m
         for y in range(0, h, cell):
             amp = cell * 0.35
@@ -644,57 +840,56 @@ class ShipEnv(gym.Env):
                 if 0 <= y2 < h:
                     surf.set_at((x, y2), dark)
 
-        # Light diagonal highlights
         highlight = (min(255, base[0] + 28), min(255, base[1] + 28), min(255, base[2] + 28))
         step = max(6, cell // 2)
         for d in range(-h, w, step):
             pygame.draw.aaline(surf, highlight, (d, 0), (d + h, h))
 
     def _handle_input(self):
-        """Process window events and live calibration keys."""
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.close()
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_LEFTBRACKET:    # '['
-                    self.G.sprite_heading_deg_offset -= 5.0
-                    print(f"sprite_heading_deg_offset = {self.G.sprite_heading_deg_offset}")
-                elif event.key == pygame.K_RIGHTBRACKET: # ']'
-                    self.G.sprite_heading_deg_offset += 5.0
-                    print(f"sprite_heading_deg_offset = {self.G.sprite_heading_deg_offset}")
-                elif event.key == pygame.K_LEFT:
-                    x, y = self.G.sprite_px_offset
-                    self.G.sprite_px_offset = (x - 1, y)
-                    print(f"sprite_px_offset = {self.G.sprite_px_offset}")
-                elif event.key == pygame.K_RIGHT:
-                    x, y = self.G.sprite_px_offset
-                    self.G.sprite_px_offset = (x + 1, y)
-                    print(f"sprite_px_offset = {self.G.sprite_px_offset}")
-                elif event.key == pygame.K_UP:
-                    x, y = self.G.sprite_px_offset
-                    self.G.sprite_px_offset = (x, y - 1)
-                    print(f"sprite_px_offset = {self.G.sprite_px_offset}")
-                elif event.key == pygame.K_DOWN:
-                    x, y = self.G.sprite_px_offset
-                    self.G.sprite_px_offset = (x, y + 1)
-                    print(f"sprite_px_offset = {self.G.sprite_px_offset}")
-                elif event.key == pygame.K_v:
-                    self.G.show_velocity_vector = not self.G.show_velocity_vector
-                    print(f"show_velocity_vector = {self.G.show_velocity_vector}")
-                elif event.key == pygame.K_t:
-                    # Preserve original behavior AND add rays toggle
-                    self.G.show_debug_triangle = not self.G.show_debug_triangle
-                    self.G.show_rays = not self.G.show_rays
-                    print(f"show_debug_triangle = {self.G.show_debug_triangle}, show_rays = {self.G.show_rays}")
-                elif event.key == pygame.K_0:
-                    self.G.sprite_heading_deg_offset = 0.0
-                    self.G.sprite_px_offset = (0, 0)
-                    print("sprite_heading_deg_offset=0, sprite_px_offset=(0,0)")
+        try:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.close()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_LEFTBRACKET:
+                        self.G.sprite_heading_deg_offset -= 5.0
+                        print(f"sprite_heading_deg_offset = {self.G.sprite_heading_deg_offset}")
+                    elif event.key == pygame.K_RIGHTBRACKET:
+                        self.G.sprite_heading_deg_offset += 5.0
+                        print(f"sprite_heading_deg_offset = {self.G.sprite_heading_deg_offset}")
+                    elif event.key == pygame.K_LEFT:
+                        x, y = self.G.sprite_px_offset
+                        self.G.sprite_px_offset = (x - 1, y)
+                        print(f"sprite_px_offset = {self.G.sprite_px_offset}")
+                    elif event.key == pygame.K_RIGHT:
+                        x, y = self.G.sprite_px_offset
+                        self.G.sprite_px_offset = (x + 1, y)
+                        print(f"sprite_px_offset = {self.G.sprite_px_offset}")
+                    elif event.key == pygame.K_UP:
+                        x, y = self.G.sprite_px_offset
+                        self.G.sprite_px_offset = (x, y - 1)
+                        print(f"sprite_px_offset = {self.G.sprite_px_offset}")
+                    elif event.key == pygame.K_DOWN:
+                        x, y = self.G.sprite_px_offset
+                        self.G.sprite_px_offset = (x, y + 1)
+                        print(f"sprite_px_offset = {self.G.sprite_px_offset}")
+                    elif event.key == pygame.K_v:
+                        self.G.show_velocity_vector = not self.G.show_velocity_vector
+                        print(f"show_velocity_vector = {self.G.show_velocity_vector}")
+                    elif event.key == pygame.K_t:
+                        self.G.show_debug_triangle = not self.G.show_debug_triangle
+                        self.G.show_rays = not self.G.show_rays
+                        print(f"show_debug_triangle = {self.G.show_debug_triangle}, show_rays = {self.G.show_rays}")
+                    elif event.key == pygame.K_0:
+                        self.G.sprite_heading_deg_offset = 0.0
+                        self.G.sprite_px_offset = (0, 0)
+                        print("sprite_heading_deg_offset=0, sprite_px_offset=(0,0)")
+        except pygame.error:
+            pass
 
     def _draw_water(self):
         if not self._water_surf:
             return
-        # static by default; enable scroll by raising water_scroll_px_per_step
         self._water_offset = (self._water_offset + self.G.water_scroll_px_per_step) % self._win_h
         off = self._water_offset
         self._surf.blit(self._water_surf, (0, off - self._win_h))
@@ -722,10 +917,8 @@ class ShipEnv(gym.Env):
             pygame.draw.circle(surf, self.G.rock_stroke, (sx, sy), r_px, 2)
 
     def _draw_rays(self, surf):
-        # Only in render mode, with rays enabled and cached distances available
         if not self._render_on or not self.P.num_rays or not self.G.show_rays or self._last_ray_ds is None:
             return
-
         x0, y0 = self.x, self.y
         sx0, sy0 = self._world_to_screen(x0, y0)
         for i, (dx, dy) in enumerate(self._ray_dirs):
@@ -735,36 +928,51 @@ class ShipEnv(gym.Env):
             ex = x0 + d * dx
             ey = y0 + d * dy
             sxe, sye = self._world_to_screen(ex, ey)
-
-            # ray line up to hit
             pygame.draw.aaline(surf, self.G.ray_color, (sx0, sy0), (sxe, sye))
-            # hit marker
             pygame.draw.circle(surf, self.G.ray_hit_color, (sxe, sye), 3)
+
+    def _draw_ai_ships(self, surf):
+        if not self._ai_ships:
+            return
+        Lb = self.G.ship_length_m
+        Wb = self.G.ship_width_m
+        body = np.array([[+0.5 * Lb, 0.0], [-0.5 * Lb, +0.5 * Wb], [-0.5 * Lb, -0.5 * Wb]])
+
+        for s in self._ai_ships:
+            color = (150, 150, 150)
+            if s["kind"] == "bf":
+                color = self.G.ai_backforth_color
+            elif s["kind"] == "wp":
+                color = self.G.ai_waypoint_color
+            elif s["kind"] == "chase":
+                color = self.G.ai_chaser_color
+
+            R = np.array([[s["dx"], s["dy"]], [-s["dy"], s["dx"]]])
+            world = (R @ body.T).T + np.array([s["x"], s["y"]])
+            pts = [self._world_to_screen(px, py) for (px, py) in world]
+            pygame.draw.polygon(surf, color, pts)
+            pygame.draw.polygon(surf, (0, 0, 0), pts, 2)
 
     def _draw_ship(self, surf):
         cx, cy = self._world_to_screen(self.x, self.y)
 
         if self._sprite_img_scaled is not None:
-            # Match sprite rotation to physics direction vector (dx,dy)
             angle_deg = math.degrees(math.atan2(-self.dy, self.dx)) + self.G.sprite_heading_deg_offset
             img = pygame.transform.rotozoom(self._sprite_img_scaled, angle_deg, 1.0)
             rect = img.get_rect()
             rect.center = (cx + self.G.sprite_px_offset[0], cy + self.G.sprite_px_offset[1])
             surf.blit(img, rect)
 
-            # Debug triangle under sprite for orientation comparison
             if self.G.show_debug_triangle:
                 Lb = self.G.ship_length_m
                 Wb = self.G.ship_width_m
                 body = np.array([[+0.5 * Lb, 0.0], [-0.5 * Lb, +0.5 * Wb], [-0.5 * Lb, -0.5 * Wb]])
-                # Rotation matrix from direction vector
                 R = np.array([[self.dx, self.dy], [-self.dy, self.dx]])
                 world = (R @ body.T).T + np.array([self.x, self.y])
                 pts = [self._world_to_screen(px, py) for (px, py) in world]
-                pygame.draw.polygon(surf, (255, 100, 100), pts)  # red triangle
+                pygame.draw.polygon(surf, (255, 100, 100), pts)
                 pygame.draw.polygon(surf, (180, 0, 0), pts, 2)
         else:
-            # fallback triangle (nose points in direction vector)
             Lb = self.G.ship_length_m
             Wb = self.G.ship_width_m
             body = np.array([[+0.5 * Lb, 0.0], [-0.5 * Lb, +0.5 * Wb], [-0.5 * Lb, -0.5 * Wb]])
@@ -774,32 +982,33 @@ class ShipEnv(gym.Env):
             pygame.draw.polygon(surf, (30, 144, 255), pts)
             pygame.draw.polygon(surf, (0, 60, 120), pts, 2)
 
-        # Optional velocity vector for debugging alignment
         if self.G.show_velocity_vector and self.v > 1e-6:
             arrow_len = max(10, int(self.v * self.G.render_scale_px_per_m * 0.3))
             tip_x = cx + int(arrow_len * self.dx)
-            tip_y = cy - int(arrow_len * self.dy)  # minus because screen y is inverted
+            tip_y = cy - int(arrow_len * self.dy)
             pygame.draw.line(surf, (0, 0, 0), (cx, cy), (tip_x, tip_y), 2)
             pygame.draw.circle(surf, (0, 0, 0), (tip_x, tip_y), 3)
 
     def _render_frame(self):
-        # handle window + live calibration input
         self._handle_input()
 
         if self._surf is None:
-            self._surf = pygame.Surface((self._win_w, self._win_h)).convert()
+            try:
+                self._surf = pygame.Surface((self._win_w, self._win_h)).convert()
+            except pygame.error as e:
+                print(f"Warning: Could not create surface: {e}")
+                return None
 
-        # background
         self._surf.fill(self.G.water_primary)
         self._draw_water()
 
-        # overlays
         if self.G.show_grid:
             self._draw_grid(self._surf)
         self._draw_rocks(self._surf)
         self._draw_goal(self._surf)
+        self._draw_ai_ships(self._surf)
         self._draw_trail(self._surf)
-        self._draw_rays(self._surf)   # draw rays to their hit points
+        self._draw_rays(self._surf)
         self._draw_ship(self._surf)
 
         if self.render_mode == "human":
@@ -817,7 +1026,7 @@ class ShipEnv(gym.Env):
 
         return None
 
-    # (optional) grid if you ever want it back
+    # (optional) grid
     def _draw_grid(self, surf):
         L = self.P.world_size
         s = self.G.render_scale_px_per_m

@@ -1,11 +1,11 @@
 To do:
 add multiple waypoints
 raycasting, configurable number of rays, detects both rocks and ships and the edge of the screen though not goal.
-(maybe draw a wall around the screen so clear that it's an obstacle)
+(maybe draw a wall around the screen so clear that it's an obstacle) done
 
 add ships which just move backwards and forwards
 ships that move towards a random waypoint(s), then stop.
-Ships that chase the main ship?
+Ships that chase the main ship
 slight drift to rocks?
 wind speed/direction, which changes over the course of the episode? Ship can detect this
 add image to readme, or gif
@@ -13,3 +13,11 @@ create pip package for environment
 add better sprites
 
 vectorize? https://gymnasium.farama.org/introduction/speed_up_env/
+
+
+        reward = 0
+        # Small penalty for not moving (encourage movement)
+        if v < 0.1:  # Very low velocity threshold
+            reward -= 0.5  # Small penalty for not moving
+        else:
+            reward = -dist_goal * 0.1 # Otherwise, reward based on distance to goal

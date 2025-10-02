@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt 
 
 import shipenv  # This registers the Ship-v0 environment
 
@@ -19,16 +19,32 @@ import shipenv  # This registers the Ship-v0 environment
 class DQN(nn.Module):
     """Deep Q-Network with fully connected layers."""
     
-    def __init__(self, state_size: int, action_size: int, hidden_size: int = 128):
+    def __init__(self, state_size: int, action_size: int, hidden_size: list = [64, 32, 16]):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, action_size)
+        self.layers = nn.ModuleList()
+        
+        # First layer: state_size -> hidden_size[0]
+        self.layers.append(nn.Linear(state_size, hidden_size[0]))
+        
+        # Hidden layers: hidden_size[i] -> hidden_size[i+1]
+        for i in range(len(hidden_size) - 1):
+            self.layers.append(nn.Linear(hidden_size[i], hidden_size[i+1]))
+        
+        # Output layer: hidden_size[-1] -> action_size
+        self.layers.append(nn.Linear(hidden_size[-1], action_size))
         
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        # Apply ReLU to all layers except the last one
+        for i, layer in enumerate(self.layers[:-1]):
+            x = F.relu(layer(x))
+        # Final layer without ReLU
+        return self.layers[-1](x)
+    
+    def save(self, path: str):
+        torch.save(self.state_dict(), path)
+    
+    def load(self, path: str):
+        self.load_state_dict(torch.load(path))
 
 
 class ReplayBuffer:
@@ -38,8 +54,13 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
         
     def push(self, state, action, reward, next_state, done):
-        """Add experience to buffer."""
-        self.buffer.append((state, action, reward, next_state, done))
+        self.buffer.append((
+            np.array(state, copy=True),       # <— copy!
+            int(action),
+            float(reward),
+            np.array(next_state, copy=True),  # <— copy!
+            bool(done),
+        ))
         
     def sample(self, batch_size: int):
         """Sample random batch from buffer."""
@@ -55,9 +76,9 @@ class DQNAgent:
     """DQN Agent with experience replay and target network."""
     
     def __init__(self, state_size: int, action_size: int, lr: float = 1e-3, 
-                 gamma: float = 0.99, epsilon: float = 1.0, epsilon_decay: float = 0.995,
+                 gamma: float = 0.99, epsilon: float = 1.0, epsilon_decay: float = 0.95,
                  epsilon_min: float = 0.01, buffer_size: int = 10000, batch_size: int = 64,
-                 target_update: int = 100, device: str = None):
+                 target_update: int = 100, device: str = None, hidden_size: list = [64, 32, 16]):
         
         self.state_size = state_size
         self.action_size = action_size
@@ -68,13 +89,13 @@ class DQNAgent:
         self.epsilon_min = epsilon_min
         self.batch_size = batch_size
         self.target_update = target_update
-        
+        self.hidden_size = hidden_size
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         
         # Networks
-        self.q_network = DQN(state_size, action_size).to(self.device)
-        self.target_network = DQN(state_size, action_size).to(self.device)
+        self.q_network = DQN(state_size, action_size, hidden_size).to(self.device)
+        self.target_network = DQN(state_size, action_size, hidden_size).to(self.device)
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
         
         # Copy weights to target network
@@ -87,13 +108,26 @@ class DQNAgent:
         self.step_count = 0
         
     def act(self, state: np.ndarray, training: bool = True) -> int:
-        """Choose action using epsilon-greedy policy."""
         if training and random.random() < self.epsilon:
             return random.randrange(self.action_size)
-        
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        q_values = self.q_network(state_tensor)
-        return q_values.argmax().item()
+
+        state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        q = self.q_network(state_tensor).squeeze(0)  # shape: [action_size]
+
+        # Robustify: replace NaN with very low, +inf with very high, -inf with very low
+        qf = torch.nan_to_num(q, nan=-1e30, posinf=1e30, neginf=-1e30)
+
+        max_q = qf.max()
+        best = (qf == max_q).nonzero(as_tuple=False).squeeze(1)
+
+        # Fallback guard (shouldn't hit now, but just in case)
+        if best.numel() == 0:
+            return int(torch.argmax(qf).item())
+
+        idx = best[torch.randint(0, best.numel(), (1,), device=q.device)].item()
+        return idx
+
+
     
     def step(self, state, action, reward, next_state, done):
         """Store experience and train if enough samples."""
@@ -130,7 +164,8 @@ class DQNAgent:
             target_q_values = rewards + (self.gamma * next_q_values * ~dones)
         
         # Compute loss
-        loss = F.mse_loss(current_q_values.squeeze(), target_q_values)
+        loss = F.smooth_l1_loss(current_q_values.squeeze(), target_q_values)
+
         
         # Optimize
         self.optimizer.zero_grad()
@@ -255,12 +290,12 @@ def plot_training(scores: List[float], save_path: str = None):
 
 def main():
     parser = argparse.ArgumentParser(description='Train DQN on Ship Environment')
-    parser.add_argument('--episodes', type=int, default=100, help='Number of training episodes')
+    parser.add_argument('--episodes', type=int, default=1000, help='Number of training episodes')
     parser.add_argument('--test_episodes', type=int, default=5, help='Number of test episodes')
-    parser.add_argument('--lr', type=float, default=1e-2, help='Learning rate')
-    parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--gamma', type=float, default=0.999, help='Discount factor')
     parser.add_argument('--epsilon', type=float, default=1.0, help='Initial epsilon')
-    parser.add_argument('--epsilon_decay', type=float, default=0.995, help='Epsilon decay rate')
+    parser.add_argument('--epsilon_decay', type=float, default=0.999, help='Epsilon decay rate')
     parser.add_argument('--epsilon_min', type=float, default=0.01, help='Minimum epsilon')
     parser.add_argument('--buffer_size', type=int, default=10000, help='Replay buffer size')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
@@ -269,7 +304,6 @@ def main():
     parser.add_argument('--plot_path', type=str, default='training_progress.png', help='Path to save training plot')
     parser.add_argument('--render', action='store_true', help='Enable rendering during training (slower, for visualization)')
     parser.add_argument('--no_test_render', action='store_true', help='Disable rendering during testing')
-    
     args = parser.parse_args()
     
     # Create environment - use None for fast training by default, "human" only if explicitly requested
@@ -278,6 +312,7 @@ def main():
     # Get environment dimensions dynamically
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n
+    hidden_size = [64, 32, 16]
     
     print(f"Environment loaded:")
     print(f"  State space: {env.observation_space}")
@@ -304,7 +339,8 @@ def main():
         epsilon_min=args.epsilon_min,
         buffer_size=args.buffer_size,
         batch_size=args.batch_size,
-        target_update=args.target_update
+        target_update=args.target_update,
+        hidden_size=hidden_size
     )
     
     # Train agent
