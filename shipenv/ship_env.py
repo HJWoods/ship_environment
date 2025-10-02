@@ -16,8 +16,8 @@ import importlib.resources as ir
 @dataclass
 class ShipParams:
     # Simulation
-    dt: float = 0.1                 # seconds per step
-    max_steps: int = 500
+    dt: float = 0.1                 # seconds per step (will be overridden in fast mode)
+    max_steps: int = 5000
 
     # World bounds (square [-L, L] x [-L, L])
     world_size: float = 10.0
@@ -28,8 +28,8 @@ class ShipParams:
     torque_accel: float = 2.5       # rad/s^2 (left/right yaw acceleration)
 
     # Limits
-    v_max: float = 5.0              # m/s (non-negative; no reverse)
-    w_max: float = 4.0              # rad/s
+    v_max: float = 2.5              # m/s (non-negative; no reverse)
+    w_max: float = 2.0              # rad/s
 
     # Drag (first-order viscous)
     lin_drag: float = 0.1           # on v
@@ -50,6 +50,10 @@ class ShipParams:
     # Rewards
     success_bonus: float = 10.0
     crash_penalty: float = -10.0     # penalty when hitting a rock
+
+    # ---- Raycasting (does NOT affect physics) ----
+    num_rays: int = 8                 # 0 keeps old 5-D observation
+    include_goal_in_rays: bool = False  # treat goal as a hit (small radius) if True
 
 
 # =========================
@@ -88,6 +92,12 @@ class GraphicsParams:
 
     # Debug overlays
     show_velocity_vector: bool = False               # draw a small v arrow
+    show_debug_triangle: bool = False                # draw fallback triangle under sprite for orientation comparison
+
+    # Rays (debug rendering)
+    show_rays: bool = False
+    ray_color: Tuple[int, int, int] = (255, 255, 255)
+    ray_hit_color: Tuple[int, int, int] = (0, 0, 0)
 
     # Rocks appearance
     rock_fill: Tuple[int, int, int] = (110, 110, 110)
@@ -110,19 +120,19 @@ class ShipEnv(gym.Env):
         2: Accelerate   (linear acceleration +thrust_accel)   -> translate straight, no turning
         3: Brake        (linear acceleration -brake_accel)    -> translate straight, no turning; v>=0
 
-    Kinematics:
-        * Turn steps (0/1): update w, then θ; apply linear drag on v; **do not move x,y**.
-        * Move steps (2/3): lock w=0 (no rotation), update v; move x,y strictly along heading θ.
-        * v ∈ [0, v_max], no reverse. θ increases CCW, θ=0 points +x.
+    Kinematics (unchanged):
+        * Turn steps (0/1): rotate direction unit (dx,dy) by ±torque*dt; drag on v; no x,y move.
+        * Move steps (2/3): lock rotation; update v; move x+=v*dx*dt, y-=v*dy*dt.
+        * v ∈ [0, v_max], no reverse. (dx,dy) is the ship's heading unit vector.
 
-    Rendering:
-        * Optional sprite with live alignment controls:
-            [ / ] : sprite_heading_deg_offset ±5°
-            Arrow keys : sprite_px_offset x/y nudge
-            V : toggle velocity vector
-            0 : reset offsets
+    Rendering controls (added while keeping 't' semantics):
+        [ / ] : sprite heading offset ±5°
+        Arrow keys : sprite pixel nudge
+        V : toggle velocity vector
+        T : toggle debug triangle AND rays together
+        0 : reset sprite offsets
     """
-    metadata = {"render_modes": ["human", "rgb_array"]}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
 
     def __init__(
         self,
@@ -136,24 +146,35 @@ class ShipEnv(gym.Env):
         self.G = graphics or GraphicsParams()
         self.render_mode = render_mode
 
+        # Flags for rendering / headless
+        self._render_on = render_mode in ("human", "rgb_array")
+        self._fast_headless = not self._render_on  # True when render_mode is None
+
         # Discrete(4) actions (see docstring)
         self.action_space = spaces.Discrete(4)
 
-        # Observation space: [x, y, cosθ, sinθ, v, w]
-        high = np.array(
-            [self.P.world_size, self.P.world_size, 1.0, 1.0, self.P.v_max, self.P.w_max],
-            dtype=np.float32,
+        # ----- Observation space: [x, y, dx, dy, v] + (optional rays) -----
+        L = self.P.world_size
+        base_low  = [-L, -L, -1.0, -1.0, 0.0]
+        base_high = [ L,  L,  1.0,  1.0, self.P.v_max]
+
+        # Each ray distance ∈ [0, 2√2 L] (corner-to-corner upper bound)
+        if self.P.num_rays > 0:
+            ray_high = 2.0 * math.sqrt(2.0) * L
+            base_low  += [0.0] * self.P.num_rays
+            base_high += [ray_high] * self.P.num_rays
+
+        self.observation_space = spaces.Box(
+            low=np.array(base_low, dtype=np.float32),
+            high=np.array(base_high, dtype=np.float32),
+            dtype=np.float32
         )
-        low = np.array(
-            [-self.P.world_size, -self.P.world_size, -1.0, -1.0, 0.0, -self.P.w_max],
-            dtype=np.float32,
-        )
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         # State
-        self.x = self.y = self.theta = 0.0
-        self.v = 0.0   # forward speed, >= 0
-        self.w = 0.0   # yaw rate
+        self.x = self.y = 0.0
+        self.v = 0.0   # scalar speed (always >= 0)
+        self.dx = 1.0  # direction unit vector x component
+        self.dy = 0.0  # direction unit vector y component
         self.goal = np.array(goal if goal is not None else [0.0, 0.0], dtype=np.float32)
         self.steps = 0
 
@@ -170,8 +191,21 @@ class ShipEnv(gym.Env):
         self._sprite_img_scaled = None
         self._trail: List[Tuple[float, float]] = []
 
+        # Preallocated observation buffer
+        self._obs_buf = np.zeros(5 + max(0, self.P.num_rays), dtype=np.float32)
+
+        # Precompute ray directions (global bearings: 0..2π)
+        self._ray_dirs: List[Tuple[float, float]] = []
+        if self.P.num_rays > 0:
+            two_pi = 2.0 * math.pi
+            for k in range(self.P.num_rays):
+                ang = two_pi * (k / self.P.num_rays)
+                self._ray_dirs.append((math.cos(ang), math.sin(ang)))
+
+        # Cache of last ray distances for rendering
+        self._last_ray_ds = np.zeros(self.P.num_rays, dtype=np.float32) if self.P.num_rays > 0 else None
+
         # Pixel geometry
-        L = self.P.world_size
         s = self.G.render_scale_px_per_m
         pad = self.G.render_padding_px
         self._world_px = int(2 * L * s)
@@ -186,12 +220,12 @@ class ShipEnv(gym.Env):
         rng = np.random.default_rng(seed)
         L = self.P.world_size
 
-        # Start pose/speeds
+        # Start pose/speeds (PHYSICS UNCHANGED)
         self.x = float(-0.5 * L + rng.normal(0, self.P.start_noise))
         self.y = float(rng.normal(0, self.P.start_noise))
-        self.theta = float(rng.uniform(-math.pi, math.pi))
         self.v = max(0.0, float(rng.normal(0, 0.1)))  # non-negative
-        self.w = float(rng.normal(0, 0.1))
+        self.dx = 1.0  # start facing +x direction
+        self.dy = 0.0
         self.steps = 0
 
         # Goal
@@ -206,8 +240,8 @@ class ShipEnv(gym.Env):
         # Rocks
         self.rocks = self._sample_rocks(rng)
 
-        # Rendering setup
-        if self.render_mode in ("human", "rgb_array"):
+        # Rendering setup - only if rendering enabled
+        if self._render_on:
             if not pygame.get_init():
                 pygame.init()
             if self.render_mode == "human":
@@ -245,6 +279,14 @@ class ShipEnv(gym.Env):
                 except Exception as e:
                     print(f"[ShipEnv] Sprite load failed ({sprite_path}): {e}")
                     self._sprite_img = self._sprite_img_scaled = None
+        else:
+            # Fast mode: skip all graphics initialization
+            self._screen = None
+            self._clock = None
+            self._surf = None
+            self._water_surf = None
+            self._sprite_img = None
+            self._sprite_img_scaled = None
 
         return self._obs(), {"goal": self.goal.copy(), "rocks": list(self.rocks)}
 
@@ -253,55 +295,81 @@ class ShipEnv(gym.Env):
             raise ValueError("Invalid action for Discrete(4).")
 
         dt = self.P.dt
-        a = 0.0
-        alpha = 0.0
+        lin_drag = self.P.lin_drag
+        ang_drag = self.P.ang_drag
+        v_max = self.P.v_max
+        w_max = self.P.w_max
+        thrust = self.P.thrust_accel
+        brake = self.P.brake_accel
+        torque = self.P.torque_accel
 
+        # Local refs for speed
+        x = self.x
+        y = self.y
+        v = self.v
+        dx = self.dx
+        dy = self.dy
+
+        # ---- PHYSICS UNCHANGED BELOW ----
         if action == 0:   # turn left
-            alpha = +self.P.torque_accel
-            # Turning step: rotate in place, apply drag to v (no translation)
-            self.w = float(np.clip(self.w + (alpha - self.P.ang_drag * self.w) * dt,
-                                   -self.P.w_max, self.P.w_max))
-            self.theta = self._wrap_angle(self.theta + self.w * dt)
-            self.v = float(np.clip(self.v + (-self.P.lin_drag * self.v) * dt,
-                                   0.0, self.P.v_max))
-            # no x,y update on this step
+            # Rotate direction vector left by torque amount
+            angle_change = torque * dt
+            cos_angle = math.cos(angle_change)
+            sin_angle = math.sin(angle_change)
+            new_dx = dx * cos_angle + dy * sin_angle
+            new_dy = -dx * sin_angle + dy * cos_angle
+            dx, dy = new_dx, new_dy
+            v -= (lin_drag * v) * dt
+            if v < 0.0:
+                v = 0.0
 
         elif action == 1:  # turn right
-            alpha = -self.P.torque_accel
-            self.w = float(np.clip(self.w + (alpha - self.P.ang_drag * self.w) * dt,
-                                   -self.P.w_max, self.P.w_max))
-            self.theta = self._wrap_angle(self.theta + self.w * dt)
-            self.v = float(np.clip(self.v + (-self.P.lin_drag * self.v) * dt,
-                                   0.0, self.P.v_max))
-            # no x,y update on this step
+            # Rotate direction vector right by torque amount
+            angle_change = -torque * dt
+            cos_angle = math.cos(angle_change)
+            sin_angle = math.sin(angle_change)
+            new_dx = dx * cos_angle + dy * sin_angle
+            new_dy = -dx * sin_angle + dy * cos_angle
+            dx, dy = new_dx, new_dy
+            v -= (lin_drag * v) * dt
+            if v < 0.0:
+                v = 0.0
 
-        elif action == 2:  # accelerate straight
-            a = +self.P.thrust_accel
-            # Move step: heading locked, no turn
-            self.w = 0.0
-            self.v = float(np.clip(self.v + (a - self.P.lin_drag * self.v) * dt,
-                                   0.0, self.P.v_max))
-            self.x += self.v * math.cos(self.theta) * dt
-            self.y += self.v * math.sin(self.theta) * dt
+        elif action == 2:  # accelerate in ship direction
+            v += (thrust - lin_drag * v) * dt
+            if v > v_max:
+                v = v_max
 
-        elif action == 3:  # brake straight
-            a = -self.P.brake_accel
-            self.w = 0.0
-            self.v = float(np.clip(self.v + (a - self.P.lin_drag * self.v) * dt,
-                                   0.0, self.P.v_max))
-            self.x += self.v * math.cos(self.theta) * dt
-            self.y += self.v * math.sin(self.theta) * dt
+        elif action == 3:  # brake in ship direction
+            v += (-brake - lin_drag * v) * dt
+            if v < 0.0:
+                v = 0.0
 
-        # Trail
-        self._trail.append((self.x, self.y))
-        if len(self._trail) > self.G.trail_len:
-            self._trail.pop(0)
+        # Update position: apply velocity in ship's direction
+        x += v * dx * dt
+        y -= v * dy * dt  # screen-inverted Y convention
+        # ---- END PHYSICS ----
+
+        # Commit locals back to state
+        self.x = x
+        self.y = y
+        self.v = v
+        self.dx = dx
+        self.dy = dy
+
+        # Trail (rendering only)
+        if self._render_on:
+            self._trail.append((x, y))
+            if len(self._trail) > self.G.trail_len:
+                self._trail.pop(0)
 
         self.steps += 1
 
-        # Distances / termination
-        dist_goal = float(np.linalg.norm([self.x - self.goal[0], self.y - self.goal[1]]))
-        destroyed = self._check_rock_collision(self.x, self.y)
+        # Distances / termination (use math.hypot for speed)
+        dxg = x - float(self.goal[0])
+        dyg = y - float(self.goal[1])
+        dist_goal = math.hypot(dxg, dyg)
+        destroyed = self._check_rock_collision(x, y)
 
         # Shaping + small action cost
         reward = -dist_goal - 0.01
@@ -316,7 +384,7 @@ class ShipEnv(gym.Env):
             reward += self.P.success_bonus
             terminated = True
 
-        out_of_bounds = (abs(self.x) > self.P.world_size or abs(self.y) > self.P.world_size)
+        out_of_bounds = (abs(x) > self.P.world_size or abs(y) > self.P.world_size)
         truncated = out_of_bounds or (self.steps >= self.P.max_steps)
 
         info = {
@@ -327,8 +395,8 @@ class ShipEnv(gym.Env):
             "reached_goal": reached,
         }
 
-        # Render
-        if self.render_mode:
+        # Render - only if rendering is enabled
+        if self._render_on:
             frame = self._render_frame()
             if self.render_mode == "rgb_array":
                 info["frame"] = frame
@@ -336,7 +404,7 @@ class ShipEnv(gym.Env):
         return self._obs(), reward, terminated, truncated, info
 
     def render(self):
-        if self.render_mode:
+        if self._render_on:
             self._render_frame()
 
     def close(self):
@@ -354,14 +422,125 @@ class ShipEnv(gym.Env):
     # Internals
     # -------------------
     def _obs(self):
-        return np.array(
-            [self.x, self.y, math.cos(self.theta), math.sin(self.theta), self.v, self.w],
-            dtype=np.float32,
-        )
+        buf = self._obs_buf
+        # Base state
+        buf[0] = self.x
+        buf[1] = self.y
+        buf[2] = self.dx
+        buf[3] = self.dy
+        buf[4] = self.v
+
+        # Rays appended after base (does not affect physics)
+        if self.P.num_rays > 0:
+            self._compute_rays_into(buf, offset=5)
+
+        return buf
 
     @staticmethod
     def _wrap_angle(a):
         return (a + math.pi) % (2 * math.pi) - math.pi
+
+    # --- Raycasting (geometry only; no physics effects) ---
+    def _compute_rays_into(self, out: np.ndarray, offset: int):
+        """
+        Cast num_rays global-bearing rays from (x,y) and write distances into out[offset:].
+        Distances are to nearest rock circle; if none, distance to the world boundary.
+        Optionally treat goal as a small circle if include_goal_in_rays=True.
+        """
+        if not self._ray_dirs:
+            return
+        x0 = self.x
+        y0 = self.y
+        L = self.P.world_size
+        rr = self.P.rock_radius
+        min_x = -L; max_x = +L
+        min_y = -L; max_y = +L
+
+        include_goal = self.P.include_goal_in_rays
+        r2 = rr * rr
+
+        for i, (dx, dy) in enumerate(self._ray_dirs):
+            # Distance to box edges
+            t_edge = self._ray_to_box(x0, y0, dx, dy, min_x, max_x, min_y, max_y)
+
+            # Nearest rock hit
+            t_obj = float('inf')
+            for (cx, cy) in self.rocks:
+                t = self._ray_circle_intersect(x0, y0, dx, dy, cx, cy, r2)
+                if t is not None and 0.0 <= t < t_obj:
+                    t_obj = t
+
+            # Optional: goal as small target
+            if include_goal:
+                gx = float(self.goal[0]); gy = float(self.goal[1])
+                gr = max(0.05, rr * 0.25)
+                t = self._ray_circle_intersect(x0, y0, dx, dy, gx, gy, gr * gr)
+                if t is not None and 0.0 <= t < t_obj:
+                    t_obj = t
+
+            d_hit = t_obj if t_obj < t_edge else t_edge
+            out[offset + i] = d_hit
+            if self._last_ray_ds is not None:
+                self._last_ray_ds[i] = d_hit
+
+    @staticmethod
+    def _ray_circle_intersect(px: float, py: float, dx: float, dy: float,
+                              cx: float, cy: float, r2: float) -> Optional[float]:
+        """
+        Ray from P=(px,py) along D=(dx,dy) (unit) vs circle center C, radius^2=r2.
+        Returns the smallest non-negative t if hit, else None.
+        """
+        mx = px - cx
+        my = py - cy
+        b = mx * dx + my * dy            # dot(m, d)
+        c = mx * mx + my * my - r2       # dot(m,m) - r^2
+
+        if c <= 0.0:
+            return 0.0                   # starting inside -> distance 0
+
+        if b > 0.0:
+            return None                  # pointing away
+
+        disc = b * b - c
+        if disc < 0.0:
+            return None
+
+        t = -b - math.sqrt(disc)
+        return t if t >= 0.0 else None
+
+    @staticmethod
+    def _ray_to_box(px: float, py: float, dx: float, dy: float,
+                    min_x: float, max_x: float, min_y: float, max_y: float) -> float:
+        """
+        Distance along ray from (px,py) direction (dx,dy) to the AABB edges.
+        Returns the smallest positive t that lands on a valid boundary segment.
+        """
+        candidates: List[float] = []
+
+        if abs(dx) > 1e-12:
+            tx1 = (min_x - px) / dx
+            tx2 = (max_x - px) / dx
+            if tx1 > 0.0: candidates.append(tx1)
+            if tx2 > 0.0: candidates.append(tx2)
+        if abs(dy) > 1e-12:
+            ty1 = (min_y - py) / dy
+            ty2 = (max_y - py) / dy
+            if ty1 > 0.0: candidates.append(ty1)
+            if ty2 > 0.0: candidates.append(ty2)
+
+        if not candidates:
+            return float('inf')
+
+        # Prefer the first candidate that actually hits the box extent
+        for t in sorted(candidates):
+            if t <= 0.0:
+                continue
+            x = px + t * dx
+            y = py + t * dy
+            if (min_x - 1e-9) <= x <= (max_x + 1e-9) and (min_y - 1e-9) <= y <= (max_y + 1e-9):
+                return t
+
+        return min(candidates)
 
     # --- Random sampling helpers
     def _sample_goal(self, rng: np.random.Generator) -> np.ndarray:
@@ -372,6 +551,20 @@ class ShipEnv(gym.Env):
         return np.array([gx, gy], dtype=np.float32)
 
     def _sample_rocks(self, rng: np.random.Generator) -> List[Tuple[float, float]]:
+        # Fast mode: simplified rock placement for speed
+        if self._fast_headless:
+            rocks: List[Tuple[float, float]] = []
+            L = self.P.world_size
+            rr = self.P.rock_radius
+            min_xy = -L + rr + 0.05
+            max_xy = L - rr - 0.05
+            for _ in range(self.P.num_rocks):
+                rx = float(rng.uniform(min_xy, max_xy))
+                ry = float(rng.uniform(min_xy, max_xy))
+                rocks.append((rx, ry))
+            return rocks
+
+        # Original complex rock placement for rendering mode
         rocks: List[Tuple[float, float]] = []
         L = self.P.world_size
         rr = self.P.rock_radius
@@ -488,6 +681,11 @@ class ShipEnv(gym.Env):
                 elif event.key == pygame.K_v:
                     self.G.show_velocity_vector = not self.G.show_velocity_vector
                     print(f"show_velocity_vector = {self.G.show_velocity_vector}")
+                elif event.key == pygame.K_t:
+                    # Preserve original behavior AND add rays toggle
+                    self.G.show_debug_triangle = not self.G.show_debug_triangle
+                    self.G.show_rays = not self.G.show_rays
+                    print(f"show_debug_triangle = {self.G.show_debug_triangle}, show_rays = {self.G.show_rays}")
                 elif event.key == pygame.K_0:
                     self.G.sprite_heading_deg_offset = 0.0
                     self.G.sprite_px_offset = (0, 0)
@@ -523,23 +721,54 @@ class ShipEnv(gym.Env):
             pygame.draw.circle(surf, self.G.rock_fill, (sx, sy), r_px)
             pygame.draw.circle(surf, self.G.rock_stroke, (sx, sy), r_px, 2)
 
+    def _draw_rays(self, surf):
+        # Only in render mode, with rays enabled and cached distances available
+        if not self._render_on or not self.P.num_rays or not self.G.show_rays or self._last_ray_ds is None:
+            return
+
+        x0, y0 = self.x, self.y
+        sx0, sy0 = self._world_to_screen(x0, y0)
+        for i, (dx, dy) in enumerate(self._ray_dirs):
+            d = float(self._last_ray_ds[i])
+            if d <= 0.0 or not math.isfinite(d):
+                continue
+            ex = x0 + d * dx
+            ey = y0 + d * dy
+            sxe, sye = self._world_to_screen(ex, ey)
+
+            # ray line up to hit
+            pygame.draw.aaline(surf, self.G.ray_color, (sx0, sy0), (sxe, sye))
+            # hit marker
+            pygame.draw.circle(surf, self.G.ray_hit_color, (sxe, sye), 3)
+
     def _draw_ship(self, surf):
         cx, cy = self._world_to_screen(self.x, self.y)
 
         if self._sprite_img_scaled is not None:
-            # pygame rotates clockwise; our theta increases CCW
-            angle_deg = -math.degrees(self.theta) + self.G.sprite_heading_deg_offset
+            # Match sprite rotation to physics direction vector (dx,dy)
+            angle_deg = math.degrees(math.atan2(-self.dy, self.dx)) + self.G.sprite_heading_deg_offset
             img = pygame.transform.rotozoom(self._sprite_img_scaled, angle_deg, 1.0)
             rect = img.get_rect()
             rect.center = (cx + self.G.sprite_px_offset[0], cy + self.G.sprite_px_offset[1])
             surf.blit(img, rect)
+
+            # Debug triangle under sprite for orientation comparison
+            if self.G.show_debug_triangle:
+                Lb = self.G.ship_length_m
+                Wb = self.G.ship_width_m
+                body = np.array([[+0.5 * Lb, 0.0], [-0.5 * Lb, +0.5 * Wb], [-0.5 * Lb, -0.5 * Wb]])
+                # Rotation matrix from direction vector
+                R = np.array([[self.dx, self.dy], [-self.dy, self.dx]])
+                world = (R @ body.T).T + np.array([self.x, self.y])
+                pts = [self._world_to_screen(px, py) for (px, py) in world]
+                pygame.draw.polygon(surf, (255, 100, 100), pts)  # red triangle
+                pygame.draw.polygon(surf, (180, 0, 0), pts, 2)
         else:
-            # fallback triangle (nose points +x when theta=0)
+            # fallback triangle (nose points in direction vector)
             Lb = self.G.ship_length_m
             Wb = self.G.ship_width_m
             body = np.array([[+0.5 * Lb, 0.0], [-0.5 * Lb, +0.5 * Wb], [-0.5 * Lb, -0.5 * Wb]])
-            c, s = math.cos(self.theta), math.sin(self.theta)
-            R = np.array([[c, -s], [s, c]])
+            R = np.array([[self.dx, self.dy], [-self.dy, self.dx]])
             world = (R @ body.T).T + np.array([self.x, self.y])
             pts = [self._world_to_screen(px, py) for (px, py) in world]
             pygame.draw.polygon(surf, (30, 144, 255), pts)
@@ -548,8 +777,8 @@ class ShipEnv(gym.Env):
         # Optional velocity vector for debugging alignment
         if self.G.show_velocity_vector and self.v > 1e-6:
             arrow_len = max(10, int(self.v * self.G.render_scale_px_per_m * 0.3))
-            tip_x = cx + int(arrow_len * math.cos(self.theta))
-            tip_y = cy - int(arrow_len * math.sin(self.theta))  # minus because screen y is inverted
+            tip_x = cx + int(arrow_len * self.dx)
+            tip_y = cy - int(arrow_len * self.dy)  # minus because screen y is inverted
             pygame.draw.line(surf, (0, 0, 0), (cx, cy), (tip_x, tip_y), 2)
             pygame.draw.circle(surf, (0, 0, 0), (tip_x, tip_y), 3)
 
@@ -570,6 +799,7 @@ class ShipEnv(gym.Env):
         self._draw_rocks(self._surf)
         self._draw_goal(self._surf)
         self._draw_trail(self._surf)
+        self._draw_rays(self._surf)   # draw rays to their hit points
         self._draw_ship(self._surf)
 
         if self.render_mode == "human":

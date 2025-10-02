@@ -1,0 +1,12 @@
+# Core dependencies for DQN training
+torch>=2.0.0
+numpy>=1.21.0
+gymnasium>=0.28.0
+matplotlib>=3.5.0
+
+# Environment dependencies
+pygame>=2.1.0
+
+# Optional: for better performance
+# torch-audio  # if you want audio support
+# torch-vision  # if you want vision support
